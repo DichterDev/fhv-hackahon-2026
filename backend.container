@@ -1,0 +1,33 @@
+[Unit]
+Description=Hackathon Go API, Queue Worker & WebSocket Backend
+After=network-online.target tailscaled.service
+Wants=tailscaled.service
+
+[Container]
+Image=localhost/hack-backend:latest
+ContainerName=hack-backend
+Network=proxy.network
+Network=hackathon.network
+
+
+Volume=~/dichter.dev/hackathon.dichter.dev/data:/data:Z
+
+Environment=PORT=8080
+Environment=DB_PATH=/data/app.db
+Environment=OLLAMA_URL=http://100.64.0.2:11434
+Environment=TD_URL=http://100.64.0.3:9000
+
+Label=traefik.enable=true
+Label=traefik.docker.network=proxy.network
+Label=traefik.http.routers.hack-backend.rule=Host(`hackathon.dichter.dev`) && (PathPrefix(`/api`) || PathPrefix(`/ws`))
+Label=traefik.http.routers.hack-backend.entrypoints=websecure
+Label=traefik.http.routers.hack-backend.tls.certresolver=letsencrypt
+Label=traefik.http.routers.hack-backend.priority=10
+Label=traefik.http.services.hack-backend.loadbalancer.server.port=8080
+
+[Service]
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
