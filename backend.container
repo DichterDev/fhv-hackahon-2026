@@ -9,11 +9,12 @@ ContainerName=hack-backend
 Network=proxy.network
 Network=hackathon.network
 
-Volume=%E/containers/hackathon/data:/data:Z
+EnvironmentFile=%E/containers/dichter.dev/hackathon/.env
+Volume=%E/containers/dichter.dev/hackathon/data:/data:Z
 
 Label=traefik.enable=true
 Label=traefik.docker.network=proxy.network
-Label=traefik.http.routers.hack-backend.rule=Host(`hackathon.dichter.dev`) && (PathPrefix(`/api`) || PathPrefix(`/ws`))
+Label=traefik.http.routers.hack-backend.rule="Host(`hackathon.dichter.dev`) && (PathPrefix(`/api`) || PathPrefix(`/ws`))"
 Label=traefik.http.routers.hack-backend.entrypoints=websecure
 Label=traefik.http.routers.hack-backend.tls.certresolver=cloudflare
 Label=traefik.http.routers.hack-backend.priority=10

@@ -8,6 +8,8 @@ ContainerName=hack-frontend
 Network=proxy.network
 Network=hackathon.network
 
+EnvironmentFile=%E/containers/dichter.dev/hackathon/.env
+
 Label=traefik.enable=true
 Label=traefik.docker.network=proxy.network
 Label=traefik.http.routers.hack-frontend.rule=Host(`hackathon.dichter.dev`)
