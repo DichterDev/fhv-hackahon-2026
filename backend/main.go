@@ -36,15 +36,15 @@ type Config struct {
 
 func loadConfig() Config {
 	llmHost := getEnv("HACK_LLM", "100.64.0.4")
-	llmPort := getEnv("HACK_LLM_PORT", "8000")
+	llmPort := getEnv("HACK_LLM_PORT", "11434")
 	tdHost := getEnv("HACK_TD", "100.64.0.5")
 	tdPort := getEnv("HACK_TD_PORT", "9000")
 
 	return Config{
 		Port:        getEnv("PORT", "8080"),
 		DBPath:      getEnv("DB_PATH", "/data/hackathon.db"),
-		OllamaURL:   fmt.Sprintf("http://%s:%s/api/generate", llmHost, llmPort),
-		OllamaModel: getEnv("OLLAMA_MODEL", "llama3.2"),
+		OllamaURL:   fmt.Sprintf("http://%s:%s/v1/chat/completions", llmHost, llmPort),
+		OllamaModel: getEnv("OLLAMA_MODEL", "qwen3:8b"),
 		TDURL:       fmt.Sprintf("http://%s:%s/api/tokens", tdHost, tdPort),
 	}
 }
@@ -412,8 +412,10 @@ func (a *App) processNextPending(ctx context.Context, client *http.Client) {
 
 func (a *App) callOllama(ctx context.Context, client *http.Client, prompt string) (string, int, int, error) {
 	body, _ := json.Marshal(map[string]any{
-		"model":  a.cfg.OllamaModel,
-		"prompt": prompt,
+		"model": a.cfg.OllamaModel,
+		"messages": []map[string]string{
+			{"role": "user", "content": prompt},
+		},
 		"stream": false,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.cfg.OllamaURL, bytes.NewReader(body))
@@ -433,14 +435,24 @@ func (a *App) callOllama(ctx context.Context, client *http.Client, prompt string
 	}
 
 	var out struct {
-		Response        string `json:"response"`
-		PromptEvalCount int    `json:"prompt_eval_count"`
-		EvalCount       int    `json:"eval_count"`
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
 		return "", 0, 0, err
 	}
-	return out.Response, out.PromptEvalCount, out.EvalCount, nil
+	if len(out.Choices) == 0 {
+		return "", 0, 0, fmt.Errorf("ollama returned empty choices")
+	}
+
+	return out.Choices[0].Message.Content, out.Usage.PromptTokens, out.Usage.CompletionTokens, nil
 }
 
 func (a *App) runOutboxRelay(ctx context.Context) {
