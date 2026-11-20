@@ -5,14 +5,14 @@ After=network-online.target
 [Container]
 Image=localhost/hack-frontend:latest
 ContainerName=hack-frontend
-Network=proxy
+Network=proxy.network
 Network=hackathon.network
 
 Label=traefik.enable=true
 Label=traefik.docker.network=proxy.network
 Label=traefik.http.routers.hack-frontend.rule=Host(`hackathon.dichter.dev`)
 Label=traefik.http.routers.hack-frontend.entrypoints=websecure
-Label=traefik.http.routers.hack-frontend.tls.certresolver=letsencrypt
+Label=traefik.http.routers.hack-frontend.tls.certresolver=cloudflare
 Label=traefik.http.routers.hack-frontend.priority=1
 Label=traefik.http.services.hack-frontend.loadbalancer.server.port=80
 
