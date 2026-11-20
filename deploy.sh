@@ -6,10 +6,15 @@ QUADLET_DIR="$HOME/.config/containers/systemd"
 
 mkdir -p "$QUADLET_DIR" "$SCRIPT_DIR/data"
 
-cp "$SCRIPT_DIR"/*.container "$QUADLET_DIR/hackathon-"
-cp "$SCRIPT_DIR"/*.network "$QUADLET_DIR/hackathon-"
+rm -f "$QUADLET_DIR/backend.container" "$QUADLET_DIR/frontend.container"
 
-/usr/lib/systemd/user-generators/podman-user-generator --dryrun
+for f in "$SCRIPT_DIR"/*.container; do
+  cp "$f" "$QUADLET_DIR/hackathon-$(basename "$f")"
+done
+
+cp "$SCRIPT_DIR/hackathon.network" "$QUADLET_DIR/hackathon.network"
+
+/usr/lib/systemd/user-generators/podman-user-generator --dryrun > /dev/null
 
 systemctl --user daemon-reload
 systemctl --user restart hackathon-network.service hackathon-backend.service hackathon-frontend.service
