@@ -417,6 +417,7 @@ func (a *App) callOllama(ctx context.Context, client *http.Client, prompt string
 			{"role": "user", "content": prompt},
 		},
 		"stream": false,
+		"think":  false,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.cfg.OllamaURL, bytes.NewReader(body))
 	if err != nil {
