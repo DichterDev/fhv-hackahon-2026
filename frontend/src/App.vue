@@ -501,7 +501,7 @@ onUnmounted(() => {
 function cardClasses(status: string): string {
   switch (status) {
     case "pending":
-      return "bg-amber-950/55 border-amber-400/45 text-amber-50";
+      return "bg-fuchsia-950/60 border-fuchsia-400/55 text-fuchsia-50";
     case "processing":
       return "bg-cyan-950/65 border-cyan-400/70 text-cyan-50 shadow-[0_0_20px_rgba(34,211,238,0.18)]";
     case "ollama_done":
@@ -510,7 +510,7 @@ function cardClasses(status: string): string {
     case "failed":
       return "bg-red-950/60 border-red-400/50 text-red-100";
     default:
-      return "bg-amber-950/55 border-amber-400/45 text-amber-50";
+      return "bg-fuchsia-950/60 border-fuchsia-400/55 text-fuchsia-50";
   }
 }
 
