@@ -1,5 +1,15 @@
-<script setup>
+<script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from "vue";
+
+interface PromptMessage {
+  id: string;
+  timestamp: string;
+  prompt: string;
+  tokens_in: number;
+  tokens_out: number;
+  water_cost_ml: number;
+  status: string;
+}
 
 // --- Config ---
 // 5.0 mL = 5,000 total tokens fills the 11,034m Mariana Trench from abyss to surface
@@ -7,7 +17,7 @@ const TRENCH_CAPACITY_ML = 5.0;
 const MAX_DEPTH_M = 11034;
 
 // --- State ---
-const messages = ref([]);
+const messages = ref<PromptMessage[]>([]);
 const promptInput = ref("");
 const isSubmitting = ref(false);
 const wsConnected = ref(false);
@@ -18,12 +28,12 @@ const needsGyroPermission = ref(false);
 let targetTilt = 0;
 let currentTilt = 0;
 let wavePhase = 0;
-let animFrameId = null;
-let ws = null;
-let reconnectTimer = null;
-let cleanupCanvas = null;
+let animFrameId: number | null = null;
+let ws: WebSocket | null = null;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let cleanupCanvas: (() => void) | null = null;
 
-const canvasRef = ref(null);
+const canvasRef = ref<HTMLCanvasElement | null>(null);
 
 // --- Totals & Trench Depth Metrics ---
 const totalWaterMl = computed(() =>
@@ -68,7 +78,7 @@ function connectWS() {
     wsConnected.value = true;
   };
 
-  ws.onmessage = (event) => {
+  ws.onmessage = (event: MessageEvent) => {
     try {
       const msg = JSON.parse(event.data);
       handleWSMessage(msg);
@@ -87,7 +97,7 @@ function connectWS() {
   };
 }
 
-function handleWSMessage(msg) {
+function handleWSMessage(msg: any) {
   const idx = messages.value.findIndex((m) => m.id === msg.prompt_id);
 
   if (msg.type === "queued") {
@@ -103,11 +113,11 @@ function handleWSMessage(msg) {
       });
     }
   } else if (msg.type === "processing") {
-    if (idx !== -1) {
+    if (idx !== -1 && messages.value[idx]) {
       messages.value[idx].status = "processing";
     }
   } else if (msg.type === "completed") {
-    if (idx !== -1) {
+    if (idx !== -1 && messages.value[idx]) {
       messages.value[idx].status = "ollama_done";
       messages.value[idx].tokens_in = msg.tokens_in ?? 0;
       messages.value[idx].tokens_out = msg.tokens_out ?? 0;
@@ -124,7 +134,7 @@ function handleWSMessage(msg) {
       });
     }
   } else if (msg.type === "error") {
-    if (idx !== -1) {
+    if (idx !== -1 && messages.value[idx]) {
       messages.value[idx].status = "failed";
     }
   }
@@ -159,26 +169,26 @@ async function submitPrompt() {
 }
 
 // --- Mobile Gyroscope & Desktop Mouse Parallax ---
-function handleOrientation(e) {
+function handleOrientation(e: DeviceOrientationEvent) {
   if (e.gamma === null) return;
   gyroEnabled.value = true;
   const clamped = Math.max(-45, Math.min(45, e.gamma));
   targetTilt = (clamped / 45) * 0.28;
 }
 
-function handleMouseMove(e) {
+function handleMouseMove(e: MouseEvent) {
   if (gyroEnabled.value) return;
   const normX = (e.clientX / window.innerWidth) * 2 - 1;
   targetTilt = normX * 0.08;
 }
 
 async function requestGyroPermission() {
-  if (
-    typeof DeviceOrientationEvent !== "undefined" &&
-    typeof DeviceOrientationEvent.requestPermission === "function"
-  ) {
+  const DOE = DeviceOrientationEvent as unknown as {
+    requestPermission?: () => Promise<"granted" | "denied">;
+  };
+  if (typeof DOE !== "undefined" && typeof DOE.requestPermission === "function") {
     try {
-      const res = await DeviceOrientationEvent.requestPermission();
+      const res = await DOE.requestPermission();
       if (res === "granted") {
         window.addEventListener("deviceorientation", handleOrientation);
         needsGyroPermission.value = false;
@@ -191,7 +201,7 @@ async function requestGyroPermission() {
 }
 
 // --- Point-Cloud Mariana Trench & Rising Water Renderer ---
-function trenchDepthAt(nx) {
+function trenchDepthAt(nx: number): number {
   const d = Math.abs(nx - 0.47);
   if (d < 0.035) {
     return 0.94 + (1 - d / 0.035) * 0.06;
@@ -204,10 +214,11 @@ function trenchDepthAt(nx) {
   return 0.16 + shelfWave;
 }
 
-function startCanvas() {
+function startCanvas(): (() => void) | null {
   const canvas = canvasRef.value;
-  if (!canvas) return;
+  if (!canvas) return null;
   const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
 
   let width = 0;
   let height = 0;
@@ -215,7 +226,14 @@ function startCanvas() {
 
   const terrainCols = 140;
   const terrainRows = 46;
-  const terrainPoints = [];
+  const terrainPoints: Array<{
+    nx: number;
+    z: number;
+    ridgeNoise: number;
+    size: number;
+    alpha: number;
+  }> = [];
+
   for (let r = 0; r < terrainRows; r++) {
     const rowNorm = r / (terrainRows - 1);
     for (let c = 0; c < terrainCols; c++) {
@@ -247,6 +265,7 @@ function startCanvas() {
   }));
 
   function resize() {
+    if (!canvas || !ctx) return;
     dpr = Math.min(window.devicePixelRatio || 1, 2);
     width = window.innerWidth;
     height = window.innerHeight;
@@ -261,6 +280,7 @@ function startCanvas() {
   let smoothedFill = fillRatio.value;
 
   function render() {
+    if (!ctx) return;
     smoothedFill += (fillRatio.value - smoothedFill) * 0.04;
     currentTilt += (targetTilt - currentTilt) * 0.08;
     wavePhase += 0.025;
@@ -284,7 +304,7 @@ function startCanvas() {
     const trenchSpanY = bottomMargin - topMargin;
 
     const baseWaterY = bottomMargin - smoothedFill * trenchSpanY;
-    const waterYAt = (screenX) => {
+    const waterYAt = (screenX: number) => {
       const relX = screenX - width * 0.5;
       const tiltOffset = Math.tan(currentTilt) * relX;
       const wave1 = Math.sin(screenX * 0.012 + wavePhase) * 4.5;
@@ -313,6 +333,7 @@ function startCanvas() {
     // 2. Point-cloud Mariana Trench bathymetry
     for (let i = 0; i < terrainPoints.length; i++) {
       const p = terrainPoints[i];
+      if (!p) continue;
       const perspectiveX = 0.5 + (p.nx - 0.5) * (1 - p.z * 0.14);
       const sx = perspectiveX * width;
       const depthNorm = trenchDepthAt(p.nx) + p.ridgeNoise;
@@ -393,10 +414,10 @@ onMounted(() => {
 
   if (typeof window !== "undefined") {
     window.addEventListener("mousemove", handleMouseMove);
-    if (
-      typeof DeviceOrientationEvent !== "undefined" &&
-      typeof DeviceOrientationEvent.requestPermission === "function"
-    ) {
+    const DOE = DeviceOrientationEvent as unknown as {
+      requestPermission?: () => Promise<"granted" | "denied">;
+    };
+    if (typeof DOE !== "undefined" && typeof DOE.requestPermission === "function") {
       needsGyroPermission.value = true;
     } else if ("DeviceOrientationEvent" in window) {
       window.addEventListener("deviceorientation", handleOrientation);
@@ -412,7 +433,7 @@ onUnmounted(() => {
   window.removeEventListener("deviceorientation", handleOrientation);
 });
 
-function statusLabel(status) {
+function statusLabel(status: string): string {
   switch (status) {
     case "pending":
       return "QUEUED";
@@ -428,7 +449,7 @@ function statusLabel(status) {
   }
 }
 
-function badgeClasses(status) {
+function badgeClasses(status: string): string {
   switch (status) {
     case "pending":
       return "bg-amber-500/20 text-amber-300 border-amber-500/40";
@@ -449,7 +470,6 @@ function badgeClasses(status) {
   <div
     class="relative flex h-dvh w-screen flex-col overflow-hidden bg-[#020813] text-slate-200 antialiased"
   >
-    <!-- Full-screen Point-Cloud Mariana Trench Canvas -->
     <canvas ref="canvasRef" class="pointer-events-none fixed inset-0 z-0 h-full w-full"></canvas>
 
     <!-- Top Bathymetric Telemetry Header -->
