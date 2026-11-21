@@ -12,8 +12,8 @@ interface PromptMessage {
 }
 
 // --- Config ---
-// 5.0 mL = 5,000 total tokens fills the 11,034m Mariana Trench from abyss to surface
-const TRENCH_CAPACITY_ML = 5.0;
+// Fixed pixel height per 1 mL step on the right-hand ruler (0 mL at bottom, scrolling up increases mL)
+const PX_PER_ML = 110;
 const MAX_DEPTH_M = 11034;
 
 // --- State ---
@@ -24,16 +24,18 @@ const wsConnected = ref(false);
 const gyroEnabled = ref(false);
 const needsGyroPermission = ref(false);
 
-// Water physics state
+// Water physics & scroll sync state
 let targetTilt = 0;
 let currentTilt = 0;
 let wavePhase = 0;
+let scrollOffsetPx = 0; // 0 = anchored at bottom (0 mL), positive = scrolled up into higher mL
 let animFrameId: number | null = null;
 let ws: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let cleanupCanvas: (() => void) | null = null;
 
 const canvasRef = ref<HTMLCanvasElement | null>(null);
+const feedRef = ref<HTMLElement | null>(null);
 
 // --- Totals & Trench Depth Metrics ---
 const totalWaterMl = computed(() =>
@@ -47,16 +49,21 @@ const totalTokens = computed(() =>
   ),
 );
 
-const fillRatio = computed(() =>
-  Math.min(1, Math.max(0.03, totalWaterMl.value / TRENCH_CAPACITY_ML)),
-);
-
-const currentDepthMeters = computed(() =>
-  Math.round(MAX_DEPTH_M * (1 - Math.min(1, totalWaterMl.value / TRENCH_CAPACITY_ML))),
-);
+const currentDepthMeters = computed(() => {
+  const ratio = Math.min(1, totalWaterMl.value / Math.max(5, Math.ceil(totalWaterMl.value + 1)));
+  return Math.round(MAX_DEPTH_M * (1 - ratio));
+});
 
 // Bottom-up order: newest messages sit at the bottom right above the composer
 const bottomUpMessages = computed(() => [...messages.value].reverse());
+
+// --- Scroll Sync Handler (scrolling up moves the mL ruler up) ---
+function handleFeedScroll() {
+  const el = feedRef.value;
+  if (!el) return;
+  // In flex-col-reverse, scrollTop is 0 at bottom and becomes negative (or positive depending on browser) when scrolling up
+  scrollOffsetPx = Math.abs(el.scrollTop);
+}
 
 // --- API & Read-Only Upstream WebSocket ---
 async function fetchHistory() {
@@ -297,18 +304,8 @@ function startCanvas(): (() => void) | null {
     bgCtx.fillRect(0, 0, width, height);
 
     const topMargin = height * 0.14;
-    const bottomMargin = height * 0.93;
+    const bottomMargin = height * 0.9;
     const trenchSpanY = bottomMargin - topMargin;
-
-    const ticks = [0, 2000, 4000, 6000, 8000, 10000, 11034];
-    bgCtx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
-    bgCtx.textAlign = "left";
-    for (const depth of ticks) {
-      const ty = topMargin + (depth / MAX_DEPTH_M) * trenchSpanY;
-      bgCtx.fillStyle = "rgba(148, 163, 184, 0.45)";
-      bgCtx.fillRect(14, ty, 10, 1);
-      bgCtx.fillText(`${depth}m`, 28, ty + 3);
-    }
 
     const dryCtx = dryTerrainLayer.getContext("2d")!;
     const wetCtx = wetTerrainLayer.getContext("2d")!;
@@ -351,7 +348,7 @@ function startCanvas(): (() => void) | null {
   resize();
   window.addEventListener("resize", resize);
 
-  let smoothedFill = fillRatio.value;
+  let smoothedWaterMl = totalWaterMl.value;
   let lastFrameTime = 0;
   const FRAME_INTERVAL = 1000 / 36;
 
@@ -361,27 +358,28 @@ function startCanvas(): (() => void) | null {
     lastFrameTime = now;
 
     if (!ctx) return;
-    smoothedFill += (fillRatio.value - smoothedFill) * 0.05;
+    smoothedWaterMl += (totalWaterMl.value - smoothedWaterMl) * 0.06;
     currentTilt += (targetTilt - currentTilt) * 0.1;
     wavePhase += 0.035;
 
-    const topMargin = height * 0.14;
-    const bottomMargin = height * 0.93;
-    const trenchSpanY = bottomMargin - topMargin;
-    const baseWaterY = bottomMargin - smoothedFill * trenchSpanY;
+    // 0 mL baseline sits near the bottom above the input bar; scrolling up shifts the ruler & waterline down in screen space
+    const zeroMlScreenY = height * 0.89 + scrollOffsetPx;
+    const baseWaterY = zeroMlScreenY - smoothedWaterMl * PX_PER_ML;
     const tanTilt = Math.tan(currentTilt);
     const halfW = width * 0.5;
 
     const waterYAt = (screenX: number) => {
       const tiltOffset = tanTilt * (screenX - halfW);
-      const wave1 = Math.sin(screenX * 0.012 + wavePhase) * 4.5;
-      const wave2 = Math.cos(screenX * 0.027 - wavePhase * 1.4) * 2.2;
+      const wave1 = Math.sin(screenX * 0.012 + wavePhase) * 4.0;
+      const wave2 = Math.cos(screenX * 0.027 - wavePhase * 1.4) * 2.0;
       return baseWaterY + tiltOffset + wave1 + wave2;
     };
 
+    // 1. Blit cached background + dry point cloud
     ctx.drawImage(bgLayer, 0, 0, width, height);
     ctx.drawImage(dryTerrainLayer, 0, 0, width, height);
 
+    // 2. Submerged water volume & glowing wet point cloud
     ctx.save();
     ctx.beginPath();
     ctx.moveTo(0, height);
@@ -394,7 +392,8 @@ function startCanvas(): (() => void) | null {
     ctx.clip();
 
     if (!cachedWaterGrad || Math.abs(baseWaterY - lastGradY) > 2) {
-      cachedWaterGrad = ctx.createLinearGradient(0, baseWaterY - 30, 0, height);
+      const gradTop = Math.max(-height, Math.min(height, baseWaterY - 30));
+      cachedWaterGrad = ctx.createLinearGradient(0, gradTop, 0, height);
       cachedWaterGrad.addColorStop(0, "rgba(34, 211, 238, 0.24)");
       cachedWaterGrad.addColorStop(0.25, "rgba(14, 116, 144, 0.18)");
       cachedWaterGrad.addColorStop(1, "rgba(3, 25, 48, 0.55)");
@@ -416,6 +415,7 @@ function startCanvas(): (() => void) | null {
     }
     ctx.restore();
 
+    // 3. Luminous waterline crest (aligned to exact mL mark at the right edge)
     ctx.beginPath();
     for (let x = 0; x <= width; x += 12) {
       const y = waterYAt(x);
@@ -426,9 +426,46 @@ function startCanvas(): (() => void) | null {
     ctx.lineWidth = 6;
     ctx.stroke();
 
-    ctx.strokeStyle = "rgba(103, 232, 249, 0.8)";
+    ctx.strokeStyle = "rgba(103, 232, 249, 0.85)";
     ctx.lineWidth = 1.5;
     ctx.stroke();
+
+    // 4. Dynamic Right-Side Cyan Height Markers (1 mL steps, 0 mL at bottom, scrolling up with feed)
+    const maxVisibleMl = Math.max(
+      Math.ceil(smoothedWaterMl) + 4,
+      Math.ceil((zeroMlScreenY + 40) / PX_PER_ML),
+    );
+    const minVisibleMl = Math.max(0, Math.floor((zeroMlScreenY - height - 40) / PX_PER_ML));
+
+    ctx.font = "600 11px ui-monospace, SFMono-Regular, Menlo, monospace";
+    ctx.textAlign = "right";
+
+    for (let ml = minVisibleMl; ml <= maxVisibleMl; ml++) {
+      const ty = zeroMlScreenY - ml * PX_PER_ML;
+      if (ty < -20 || ty > height + 20) continue;
+
+      const isSubmerged = ml <= smoothedWaterMl + 0.001;
+      // Major 1 mL tick on the right edge
+      ctx.fillStyle = isSubmerged ? "rgba(34, 211, 238, 0.95)" : "rgba(34, 211, 238, 0.55)";
+      ctx.fillRect(width - 24, ty, 14, 1.5);
+      ctx.fillText(`${ml} mL`, width - 30, ty + 3.5);
+
+      // Half-mL minor tick (0.5 mL)
+      const halfY = ty - PX_PER_ML * 0.5;
+      if (halfY >= -20 && halfY <= height + 20) {
+        ctx.fillStyle = "rgba(34, 211, 238, 0.3)";
+        ctx.fillRect(width - 17, halfY, 7, 1);
+      }
+    }
+
+    // Exact current water level indicator dot on the right ruler
+    const rightWaterY = baseWaterY + tanTilt * (width - halfW);
+    if (rightWaterY >= 0 && rightWaterY <= height) {
+      ctx.fillStyle = "#22d3ee";
+      ctx.beginPath();
+      ctx.arc(width - 10, rightWaterY, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
 
   animFrameId = requestAnimationFrame(render);
@@ -517,9 +554,8 @@ function isCompleted(status: string): boolean {
       </div>
 
       <div class="flex items-center gap-3">
-        <div
-          class="flex items-center gap-3 rounded-full border border-sky-400/30 bg-[#061428]/75 px-3.5 py-1.5 backdrop-blur-md"
-        >
+        <!-- Borderless Total Usage Readout -->
+        <div class="flex items-center gap-3.5 px-1 py-1">
           <div class="flex flex-col items-end">
             <span class="text-[9px] tracking-[0.12em] text-slate-400">WATER USED</span>
             <span class="font-mono text-sm font-bold text-cyan-400">
@@ -546,15 +582,17 @@ function isCompleted(status: string): boolean {
       </div>
     </header>
 
-    <!-- Bottom-Up Prompt & Water Cost Stream (4/5 Prompt | 1/5 Centered Telemetry Compartment) -->
+    <!-- Bottom-Up Prompt & Water Cost Stream (Sharp Rectangular Cards, Right Padding Clears mL Ruler) -->
     <main
-      class="relative z-5 flex flex-1 flex-col-reverse overflow-y-auto pt-3 pr-4 pb-2 pl-14 [mask-image:linear-gradient(to_bottom,transparent_0%,black_14%,black_100%)] [-webkit-mask-image:linear-gradient(to_bottom,transparent_0%,black_14%,black_100%)]"
+      ref="feedRef"
+      class="relative z-5 flex flex-1 flex-col-reverse overflow-y-auto pt-3 pr-20 pb-2 pl-4 [mask-image:linear-gradient(to_bottom,transparent_0%,black_14%,black_100%)] [-webkit-mask-image:linear-gradient(to_bottom,transparent_0%,black_14%,black_100%)]"
+      @scroll="handleFeedScroll"
     >
       <div class="mx-auto flex w-full max-w-2xl flex-col-reverse gap-2.5">
         <article
           v-for="item in bottomUpMessages"
           :key="item.id"
-          class="flex max-h-28 shrink-0 items-stretch overflow-hidden rounded-xl border backdrop-blur-md transition-colors duration-300"
+          class="flex max-h-28 shrink-0 items-stretch overflow-hidden border backdrop-blur-md transition-colors duration-300"
           :class="cardClasses(item.status)"
         >
           <!-- 4/5 Width: Scrollable Prompt Text within Max Height -->
@@ -597,7 +635,7 @@ function isCompleted(status: string): boolean {
     <footer
       class="relative z-10 bg-gradient-to-t from-[#020813]/95 via-[#020813]/75 to-transparent px-4 pt-2.5 pb-[calc(0.875rem+env(safe-area-inset-bottom))]"
     >
-      <form class="mx-auto flex w-full max-w-2xl gap-2" @submit.prevent="submitPrompt">
+      <form class="mx-auto flex w-full max-w-2xl items-center gap-2" @submit.prevent="submitPrompt">
         <input
           v-model="promptInput"
           type="text"
@@ -609,9 +647,10 @@ function isCompleted(status: string): boolean {
         <button
           type="submit"
           :disabled="isSubmitting || !promptInput.trim()"
-          class="cursor-pointer rounded-xl border border-cyan-400/55 bg-gradient-to-br from-cyan-600 to-sky-600 px-5 text-xs font-bold tracking-[0.1em] text-slate-50 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+          class="inline-flex cursor-pointer items-center gap-1.5 px-3 py-3 text-xs font-bold tracking-[0.12em] text-cyan-300 transition hover:text-cyan-100 disabled:cursor-not-allowed disabled:opacity-35"
         >
-          {{ isSubmitting ? "..." : "SEND" }}
+          <span>{{ isSubmitting ? "..." : "SEND" }}</span>
+          <span aria-hidden="true" class="text-sm leading-none">&rarr;</span>
         </button>
       </form>
     </footer>
