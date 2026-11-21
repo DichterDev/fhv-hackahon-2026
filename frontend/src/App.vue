@@ -173,7 +173,8 @@ function handleOrientation(e: DeviceOrientationEvent) {
   if (e.gamma === null) return;
   gyroEnabled.value = true;
   const clamped = Math.max(-45, Math.min(45, e.gamma));
-  targetTilt = (clamped / 45) * 0.28;
+  // Negative sign keeps water level with gravity: tilting right-down raises water on the right
+  targetTilt = -(clamped / 45) * 0.28;
 }
 
 function handleMouseMove(e: MouseEvent) {
@@ -433,36 +434,24 @@ onUnmounted(() => {
   window.removeEventListener("deviceorientation", handleOrientation);
 });
 
-function statusLabel(status: string): string {
+function cardClasses(status: string): string {
   switch (status) {
     case "pending":
-      return "QUEUED";
+      return "bg-amber-950/55 border-amber-400/45 text-amber-50";
     case "processing":
-      return "GENERATING";
+      return "bg-cyan-950/65 border-cyan-400/70 text-cyan-50 shadow-[0_0_20px_rgba(34,211,238,0.18)]";
     case "ollama_done":
     case "delivered":
-      return "MEASURED";
+      return "bg-emerald-950/55 border-emerald-400/45 text-emerald-50";
     case "failed":
-      return "FAILED";
+      return "bg-red-950/60 border-red-400/50 text-red-100";
     default:
-      return status?.toUpperCase() || "QUEUED";
+      return "bg-amber-950/55 border-amber-400/45 text-amber-50";
   }
 }
 
-function badgeClasses(status: string): string {
-  switch (status) {
-    case "pending":
-      return "bg-amber-500/20 text-amber-300 border-amber-500/40";
-    case "processing":
-      return "bg-cyan-400/20 text-cyan-300 border-cyan-400/50";
-    case "ollama_done":
-    case "delivered":
-      return "bg-emerald-500/15 text-emerald-300 border-emerald-500/35";
-    case "failed":
-      return "bg-red-500/20 text-red-300 border-red-500/40";
-    default:
-      return "bg-slate-500/20 text-slate-300 border-slate-500/35";
-  }
+function isCompleted(status: string): boolean {
+  return status === "ollama_done" || status === "delivered";
 }
 </script>
 
@@ -470,6 +459,7 @@ function badgeClasses(status: string): string {
   <div
     class="relative flex h-dvh w-screen flex-col overflow-hidden bg-[#020813] text-slate-200 antialiased"
   >
+    <!-- Full-screen Point-Cloud Mariana Trench Canvas -->
     <canvas ref="canvasRef" class="pointer-events-none fixed inset-0 z-0 h-full w-full"></canvas>
 
     <!-- Top Bathymetric Telemetry Header -->
@@ -525,7 +515,7 @@ function badgeClasses(status: string): string {
       </div>
     </header>
 
-    <!-- Bottom-Up Prompt & Water Cost Stream (No LLM Answers Displayed) -->
+    <!-- Bottom-Up Prompt & Water Cost Stream (4/5 Prompt | 1/5 Tokens & mL) -->
     <main
       class="relative z-5 flex flex-1 flex-col-reverse overflow-y-auto pt-3 pr-4 pb-2 pl-14 [mask-image:linear-gradient(to_bottom,transparent_0%,black_14%,black_100%)] [-webkit-mask-image:linear-gradient(to_bottom,transparent_0%,black_14%,black_100%)]"
     >
@@ -533,45 +523,38 @@ function badgeClasses(status: string): string {
         <article
           v-for="item in bottomUpMessages"
           :key="item.id"
-          class="rounded-xl border bg-[#061326]/70 px-3.5 py-2.5 backdrop-blur-md transition-all duration-200"
-          :class="[
-            item.status === 'processing'
-              ? 'border-cyan-400/65 shadow-[0_0_18px_rgba(34,211,238,0.14)]'
-              : item.status === 'failed'
-                ? 'border-red-400/50'
-                : 'border-sky-400/20',
-          ]"
+          class="flex items-center rounded-xl border backdrop-blur-md transition-colors duration-300"
+          :class="cardClasses(item.status)"
         >
-          <div class="mb-1.5 flex items-center justify-between gap-2">
-            <span
-              class="rounded-full border px-2 py-0.5 font-mono text-[10px] font-bold tracking-[0.1em]"
-              :class="badgeClasses(item.status)"
-            >
-              {{ statusLabel(item.status) }}
-            </span>
-
-            <span
-              v-if="item.status === 'ollama_done' || item.status === 'delivered'"
-              class="font-mono text-xs text-slate-400"
-            >
-              {{ (item.tokens_in || 0) + (item.tokens_out || 0) }} tok
-              <span class="mx-1 opacity-50">·</span>
-              <strong class="font-bold text-cyan-400">
-                +{{ Number(item.water_cost_ml || 0).toFixed(3) }} mL
-              </strong>
-            </span>
-
-            <span
-              v-else-if="item.status === 'processing'"
-              class="animate-pulse font-mono text-xs text-cyan-300"
-            >
-              calculating tokens...
-            </span>
+          <!-- 4/5 Width: Prompt Text -->
+          <div class="w-4/5 px-3.5 py-2.5">
+            <p class="break-words text-sm leading-snug">
+              {{ item.prompt }}
+            </p>
           </div>
 
-          <p class="break-words text-sm leading-snug text-slate-100">
-            {{ item.prompt }}
-          </p>
+          <!-- 1/5 Width: Tokens & Water Cost -->
+          <div
+            class="flex w-1/5 shrink-0 flex-col items-end justify-center self-stretch border-l border-white/10 px-2.5 py-2 text-right font-mono"
+          >
+            <template v-if="isCompleted(item.status)">
+              <span class="text-xs font-bold text-emerald-300">
+                +{{ Number(item.water_cost_ml || 0).toFixed(3) }}mL
+              </span>
+              <span class="mt-0.5 text-[11px] text-emerald-200/75">
+                {{ (item.tokens_in || 0) + (item.tokens_out || 0) }} tok
+              </span>
+            </template>
+            <template v-else>
+              <span
+                class="text-xs opacity-60"
+                :class="{ 'animate-pulse text-cyan-300 opacity-100': item.status === 'processing' }"
+              >
+                — mL
+              </span>
+              <span class="mt-0.5 text-[11px] opacity-50">— tok</span>
+            </template>
+          </div>
         </article>
       </div>
     </main>
