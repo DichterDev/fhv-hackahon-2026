@@ -8,7 +8,8 @@ CREATE TABLE IF NOT EXISTS prompts (
     prompt TEXT NOT NULL,
     response TEXT,
     tokens_in INTEGER NOT NULL DEFAULT 0,
-    tokens_out INTEGER NOT NULL DEFAULT 0
+    tokens_out INTEGER NOT NULL DEFAULT 0,
+    water_cost_ml REAL NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS queue (
