@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -42,7 +43,7 @@ func loadConfig() Config {
 	llmHost := getEnv("HACK_LLM", "100.64.0.4")
 	llmPort := getEnv("HACK_LLM_PORT", "11434")
 	tdHost := getEnv("HACK_TD", "100.64.0.5")
-	tdPort := getEnv("HACK_TD_PORT", "9000")
+	tdPort := getEnv("HACK_TD_PORT", "8000")
 
 	return Config{
 		Port:        getEnv("PORT", "8080"),
@@ -50,7 +51,7 @@ func loadConfig() Config {
 		OllamaURL:   fmt.Sprintf("http://%s:%s/api/generate", llmHost, llmPort),
 		OllamaModel: getEnv("OLLAMA_MODEL", "qwen3:8b"),
 		NumPredict:  getEnvInt("OLLAMA_NUM_PREDICT", 150),
-		TDURL:       fmt.Sprintf("http://%s:%s/api/tokens", tdHost, tdPort),
+		TDURL:       fmt.Sprintf("http://%s:%s/api/visualization/events", tdHost, tdPort),
 	}
 }
 
@@ -117,12 +118,8 @@ type App struct {
 	notifyQ chan struct{}
 }
 
-type WSIncoming struct {
-	Prompt string `json:"prompt"`
-}
-
 type WSOutgoing struct {
-	Type        string  `json:"type"` // "queued" | "processing" | "completed" | "error" | "history"
+	Type        string  `json:"type"` // "queued" | "processing" | "completed" | "error"
 	PromptID    string  `json:"prompt_id,omitempty"`
 	Prompt      string  `json:"prompt,omitempty"`
 	Response    string  `json:"response,omitempty"`
@@ -133,13 +130,16 @@ type WSOutgoing struct {
 	Error       string  `json:"error,omitempty"`
 }
 
-type TDPayload struct {
-	PromptID    string  `json:"prompt_id"`
-	Timestamp   string  `json:"timestamp"`
-	Prompt      string  `json:"prompt"`
-	TokensIn    int     `json:"tokens_in"`
-	TokensOut   int     `json:"tokens_out"`
-	WaterCostML float64 `json:"water_cost_ml"`
+type TDVisualizationEvent struct {
+	EventID      string  `json:"event_id"`
+	PromptID     string  `json:"prompt_id"`
+	Type         string  `json:"type"`
+	Prompt       string  `json:"prompt"`
+	Answer       string  `json:"answer"`
+	InputTokens  int     `json:"input_tokens"`
+	OutputTokens int     `json:"output_tokens"`
+	TotalTokens  int     `json:"total_tokens"`
+	WaterML      float64 `json:"water_ml"`
 }
 
 func main() {
@@ -179,6 +179,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
+	r.Post("/api/prompts", app.handlePostPrompt)
 	r.Get("/api/history", app.handleGetHistory)
 	r.Get("/api/td/refresh", app.handleTDRefresh)
 	r.Get("/ws", app.handleWS)
@@ -200,6 +201,72 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 }
+
+// --- HTTP Prompt Submission ---
+
+func (a *App) handlePostPrompt(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Prompt string `json:"prompt"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, `{"error":"invalid JSON payload"}`, http.StatusBadRequest)
+		return
+	}
+
+	promptText := strings.TrimSpace(in.Prompt)
+	if promptText == "" {
+		http.Error(w, `{"error":"prompt must not be empty"}`, http.StatusBadRequest)
+		return
+	}
+
+	id := "prompt-" + uuid.NewString()
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	if err := a.enqueuePrompt(id, now, promptText); err != nil {
+		log.Printf("enqueue failed: %v", err)
+		http.Error(w, `{"error":"failed to queue prompt"}`, http.StatusInternalServerError)
+		return
+	}
+
+	a.hub.broadcast(WSOutgoing{
+		Type:      "queued",
+		PromptID:  id,
+		Prompt:    promptText,
+		Timestamp: now,
+	})
+
+	select {
+	case a.notifyQ <- struct{}{}:
+	default:
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"id":        id,
+		"timestamp": now,
+		"prompt":    promptText,
+		"status":    "pending",
+	})
+}
+
+func (a *App) enqueuePrompt(id, ts, prompt string) error {
+	tx, err := a.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`INSERT INTO prompts (id, timestamp, prompt) VALUES (?, ?, ?)`, id, ts, prompt); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO queue (prompt_id, status, updated_at) VALUES (?, 'pending', ?)`, id, ts); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// --- Read-Only Upstream WebSocket ---
 
 func (a *App) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -235,53 +302,15 @@ func (a *App) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// Drain control frames until client disconnects
 	for {
-		var in WSIncoming
-		if err := wsjson.Read(r.Context(), conn, &in); err != nil {
+		if _, _, err := conn.Read(r.Context()); err != nil {
 			return
 		}
-		if in.Prompt == "" {
-			continue
-		}
-
-		id := uuid.NewString()
-		now := time.Now().UTC().Format(time.RFC3339)
-
-		if err := a.enqueuePrompt(id, now, in.Prompt); err != nil {
-			log.Printf("enqueue failed: %v", err)
-			_ = wsjson.Write(r.Context(), conn, WSOutgoing{Type: "error", Error: "failed to queue prompt"})
-			continue
-		}
-
-		a.hub.broadcast(WSOutgoing{
-			Type:      "queued",
-			PromptID:  id,
-			Prompt:    in.Prompt,
-			Timestamp: now,
-		})
-
-		select {
-		case a.notifyQ <- struct{}{}:
-		default:
-		}
 	}
 }
 
-func (a *App) enqueuePrompt(id, ts, prompt string) error {
-	tx, err := a.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.Exec(`INSERT INTO prompts (id, timestamp, prompt) VALUES (?, ?, ?)`, id, ts, prompt); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`INSERT INTO queue (prompt_id, status, updated_at) VALUES (?, 'pending', ?)`, id, ts); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
+// --- History & TouchDesigner Refresh Endpoints ---
 
 func (a *App) handleGetHistory(w http.ResponseWriter, r *http.Request) {
 	rows, err := a.db.Query(`
@@ -323,7 +352,7 @@ func (a *App) handleGetHistory(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleTDRefresh(w http.ResponseWriter, r *http.Request) {
 	rows, err := a.db.Query(`
-		SELECT p.id, p.timestamp, p.prompt, p.tokens_in, p.tokens_out, p.water_cost_ml
+		SELECT q.seq, p.id, p.prompt, COALESCE(p.response, ''), p.tokens_in, p.tokens_out, p.water_cost_ml
 		FROM prompts p
 		JOIN queue q ON p.id = q.prompt_id
 		WHERE q.status IN ('ollama_done', 'delivered')
@@ -335,26 +364,32 @@ func (a *App) handleTDRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	var events []TDPayload
+	var events []TDVisualizationEvent
 	totalIn, totalOut := 0, 0
 	totalWaterML := 0.0
 	for rows.Next() {
-		var ev TDPayload
-		if err := rows.Scan(&ev.PromptID, &ev.Timestamp, &ev.Prompt, &ev.TokensIn, &ev.TokensOut, &ev.WaterCostML); err == nil {
+		var seq int64
+		var ev TDVisualizationEvent
+		if err := rows.Scan(&seq, &ev.PromptID, &ev.Prompt, &ev.Answer, &ev.InputTokens, &ev.OutputTokens, &ev.WaterML); err == nil {
+			ev.EventID = fmt.Sprintf("evt-%d", seq)
+			ev.Type = "generation_completed"
+			ev.TotalTokens = ev.InputTokens + ev.OutputTokens
 			events = append(events, ev)
-			totalIn += ev.TokensIn
-			totalOut += ev.TokensOut
-			totalWaterML += ev.WaterCostML
+
+			totalIn += ev.InputTokens
+			totalOut += ev.OutputTokens
+			totalWaterML += ev.WaterML
 		}
 	}
 	if events == nil {
-		events = []TDPayload{}
+		events = []TDVisualizationEvent{}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"total_tokens_in":     totalIn,
 		"total_tokens_out":    totalOut,
+		"total_tokens":        totalIn + totalOut,
 		"total_water_cost_ml": totalWaterML,
 		"count":               len(events),
 		"events":              events,
@@ -490,7 +525,7 @@ func (a *App) runOutboxRelay(ctx context.Context) {
 
 func (a *App) flushOutboxToTD(ctx context.Context, client *http.Client) {
 	rows, err := a.db.Query(`
-		SELECT p.id, p.timestamp, p.prompt, p.tokens_in, p.tokens_out, p.water_cost_ml
+		SELECT q.seq, p.id, p.prompt, COALESCE(p.response, ''), p.tokens_in, p.tokens_out, p.water_cost_ml
 		FROM queue q
 		JOIN prompts p ON p.id = q.prompt_id
 		WHERE q.status = 'ollama_done'
@@ -500,10 +535,14 @@ func (a *App) flushOutboxToTD(ctx context.Context, client *http.Client) {
 	if err != nil {
 		return
 	}
-	var batch []TDPayload
+	var batch []TDVisualizationEvent
 	for rows.Next() {
-		var ev TDPayload
-		if err := rows.Scan(&ev.PromptID, &ev.Timestamp, &ev.Prompt, &ev.TokensIn, &ev.TokensOut, &ev.WaterCostML); err == nil {
+		var seq int64
+		var ev TDVisualizationEvent
+		if err := rows.Scan(&seq, &ev.PromptID, &ev.Prompt, &ev.Answer, &ev.InputTokens, &ev.OutputTokens, &ev.WaterML); err == nil {
+			ev.EventID = fmt.Sprintf("evt-%d", seq)
+			ev.Type = "generation_completed"
+			ev.TotalTokens = ev.InputTokens + ev.OutputTokens
 			batch = append(batch, ev)
 		}
 	}
