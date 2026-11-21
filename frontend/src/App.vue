@@ -1,279 +1,580 @@
-<script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
+<script setup>
+import { ref, computed, onMounted, onUnmounted } from "vue";
 
-type PromptStatus = "pending" | "processing" | "ollama_done" | "delivered" | "failed";
+// --- Config ---
+// 5.0 mL = 5,000 total tokens fills the 11,034m Mariana Trench from abyss to surface
+const TRENCH_CAPACITY_ML = 5.0;
+const MAX_DEPTH_M = 11034;
 
-interface ChatItem {
-  id: string;
-  timestamp: string;
-  prompt: string;
-  response: string;
-  tokens_in: number;
-  tokens_out: number;
-  status: PromptStatus;
-}
-
-interface WSMessage {
-  type: "queued" | "processing" | "completed" | "error";
-  prompt_id?: string;
-  prompt?: string;
-  response?: string;
-  tokens_in?: number;
-  tokens_out?: number;
-  timestamp?: string;
-  error?: string;
-}
-
-const messages = ref<ChatItem[]>([]);
-const inputPrompt = ref("");
+// --- State ---
+const messages = ref([]);
+const promptInput = ref("");
+const isSubmitting = ref(false);
 const wsConnected = ref(false);
-const chatContainer = ref<HTMLElement | null>(null);
+const gyroEnabled = ref(false);
+const needsGyroPermission = ref(false);
 
-let socket: WebSocket | null = null;
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+// Water physics state
+let targetTilt = 0;
+let currentTilt = 0;
+let wavePhase = 0;
+let animFrameId = null;
+let ws = null;
+let reconnectTimer = null;
+let cleanupCanvas = null;
+
+const canvasRef = ref(null);
+
+// --- Totals & Trench Depth Metrics ---
+const totalWaterMl = computed(() =>
+  messages.value.reduce((sum, m) => sum + (Number(m.water_cost_ml) || 0), 0),
+);
 
 const totalTokens = computed(() =>
   messages.value.reduce(
-    (acc, m) => {
-      acc.in += m.tokens_in || 0;
-      acc.out += m.tokens_out || 0;
-      return acc;
-    },
-    { in: 0, out: 0 },
+    (sum, m) => sum + (Number(m.tokens_in) || 0) + (Number(m.tokens_out) || 0),
+    0,
   ),
 );
 
-const scrollToBottom = async () => {
-  await nextTick();
-  if (chatContainer.value) {
-    chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
-  }
-};
+const fillRatio = computed(() =>
+  Math.min(1, Math.max(0.03, totalWaterMl.value / TRENCH_CAPACITY_ML)),
+);
 
-async function fetchHistory(): Promise<void> {
+const currentDepthMeters = computed(() =>
+  Math.round(MAX_DEPTH_M * (1 - Math.min(1, totalWaterMl.value / TRENCH_CAPACITY_ML))),
+);
+
+// Bottom-up order: newest messages sit at the bottom right above the composer
+const bottomUpMessages = computed(() => [...messages.value].reverse());
+
+// --- API & Read-Only Upstream WebSocket ---
+async function fetchHistory() {
   try {
     const res = await fetch("/api/history");
-    if (res.ok) {
-      const data: ChatItem[] = await res.json();
-      messages.value = data;
-      await scrollToBottom();
-    }
+    if (!res.ok) return;
+    const data = await res.json();
+    messages.value = Array.isArray(data) ? data : [];
   } catch (err) {
-    console.error("Failed to fetch history:", err);
+    console.error("Failed to load history:", err);
   }
 }
 
-function connectWS(): void {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const wsUrl = `${protocol}//${window.location.host}/ws`;
+function connectWS() {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${window.location.host}/ws`);
 
-  socket = new WebSocket(wsUrl);
-
-  socket.onopen = () => {
+  ws.onopen = () => {
     wsConnected.value = true;
   };
 
-  socket.onmessage = async (event: MessageEvent<string>) => {
-    const msg: WSMessage = JSON.parse(event.data);
-
-    if (msg.type === "queued" && msg.prompt_id) {
-      const exists = messages.value.some((m) => m.id === msg.prompt_id);
-      if (!exists) {
-        messages.value.push({
-          id: msg.prompt_id,
-          prompt: msg.prompt ?? "",
-          response: "",
-          tokens_in: 0,
-          tokens_out: 0,
-          status: "pending",
-          timestamp: msg.timestamp ?? new Date().toISOString(),
-        });
-        await scrollToBottom();
-      }
-    } else if (msg.type === "processing" && msg.prompt_id) {
-      const item = messages.value.find((m) => m.id === msg.prompt_id);
-      if (item) item.status = "processing";
-    } else if (msg.type === "completed" && msg.prompt_id) {
-      const item = messages.value.find((m) => m.id === msg.prompt_id);
-      if (item) {
-        item.response = msg.response ?? "";
-        item.tokens_in = msg.tokens_in ?? 0;
-        item.tokens_out = msg.tokens_out ?? 0;
-        item.status = "ollama_done";
-        await scrollToBottom();
-      }
-    } else if (msg.type === "error" && msg.prompt_id) {
-      const item = messages.value.find((m) => m.id === msg.prompt_id);
-      if (item) {
-        item.status = "failed";
-        item.response = `Error: ${msg.error ?? "Unknown error"}`;
-      }
+  ws.onmessage = (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      handleWSMessage(msg);
+    } catch (e) {
+      console.error("Invalid WS payload:", e);
     }
   };
 
-  socket.onclose = () => {
+  ws.onclose = () => {
     wsConnected.value = false;
     reconnectTimer = setTimeout(connectWS, 2000);
   };
 
-  socket.onerror = () => {
-    socket?.close();
+  ws.onerror = () => {
+    ws?.close();
   };
 }
 
-function sendPrompt(): void {
-  const text = inputPrompt.value.trim();
-  if (!text || !wsConnected.value || !socket) return;
+function handleWSMessage(msg) {
+  const idx = messages.value.findIndex((m) => m.id === msg.prompt_id);
 
-  socket.send(JSON.stringify({ prompt: text }));
-  inputPrompt.value = "";
-}
-
-function handleKeydown(e: KeyboardEvent): void {
-  if (e.key === "Enter" && !e.shiftKey) {
-    e.preventDefault();
-    sendPrompt();
+  if (msg.type === "queued") {
+    if (idx === -1) {
+      messages.value.push({
+        id: msg.prompt_id,
+        timestamp: msg.timestamp,
+        prompt: msg.prompt,
+        tokens_in: 0,
+        tokens_out: 0,
+        water_cost_ml: 0,
+        status: "pending",
+      });
+    }
+  } else if (msg.type === "processing") {
+    if (idx !== -1) {
+      messages.value[idx].status = "processing";
+    }
+  } else if (msg.type === "completed") {
+    if (idx !== -1) {
+      messages.value[idx].status = "ollama_done";
+      messages.value[idx].tokens_in = msg.tokens_in ?? 0;
+      messages.value[idx].tokens_out = msg.tokens_out ?? 0;
+      messages.value[idx].water_cost_ml = msg.water_cost_ml ?? 0;
+    } else {
+      messages.value.push({
+        id: msg.prompt_id,
+        timestamp: msg.timestamp,
+        prompt: msg.prompt,
+        tokens_in: msg.tokens_in ?? 0,
+        tokens_out: msg.tokens_out ?? 0,
+        water_cost_ml: msg.water_cost_ml ?? 0,
+        status: "ollama_done",
+      });
+    }
+  } else if (msg.type === "error") {
+    if (idx !== -1) {
+      messages.value[idx].status = "failed";
+    }
   }
 }
 
-function statusMeta(status: PromptStatus): { label: string; classes: string } {
-  switch (status) {
-    case "pending":
-      return { label: "Queued", classes: "bg-amber-500/15 text-amber-400" };
-    case "processing":
-      return { label: "Generating...", classes: "bg-blue-500/15 text-blue-400" };
-    case "ollama_done":
-    case "delivered":
-      return { label: "Done", classes: "bg-emerald-500/15 text-emerald-400" };
-    case "failed":
-      return { label: "Failed", classes: "bg-red-500/15 text-red-400" };
+async function submitPrompt() {
+  const text = promptInput.value.trim();
+  if (!text || isSubmitting.value) return;
+
+  if (needsGyroPermission.value) {
+    requestGyroPermission();
   }
+
+  isSubmitting.value = true;
+  promptInput.value = "";
+
+  try {
+    const res = await fetch("/api/prompts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: text }),
+    });
+    if (!res.ok) {
+      promptInput.value = text;
+    }
+  } catch (err) {
+    console.error("Submit failed:", err);
+    promptInput.value = text;
+  } finally {
+    isSubmitting.value = false;
+  }
+}
+
+// --- Mobile Gyroscope & Desktop Mouse Parallax ---
+function handleOrientation(e) {
+  if (e.gamma === null) return;
+  gyroEnabled.value = true;
+  const clamped = Math.max(-45, Math.min(45, e.gamma));
+  targetTilt = (clamped / 45) * 0.28;
+}
+
+function handleMouseMove(e) {
+  if (gyroEnabled.value) return;
+  const normX = (e.clientX / window.innerWidth) * 2 - 1;
+  targetTilt = normX * 0.08;
+}
+
+async function requestGyroPermission() {
+  if (
+    typeof DeviceOrientationEvent !== "undefined" &&
+    typeof DeviceOrientationEvent.requestPermission === "function"
+  ) {
+    try {
+      const res = await DeviceOrientationEvent.requestPermission();
+      if (res === "granted") {
+        window.addEventListener("deviceorientation", handleOrientation);
+        needsGyroPermission.value = false;
+        gyroEnabled.value = true;
+      }
+    } catch (e) {
+      console.warn("Gyro permission denied:", e);
+    }
+  }
+}
+
+// --- Point-Cloud Mariana Trench & Rising Water Renderer ---
+function trenchDepthAt(nx) {
+  const d = Math.abs(nx - 0.47);
+  if (d < 0.035) {
+    return 0.94 + (1 - d / 0.035) * 0.06;
+  }
+  if (d < 0.23) {
+    const t = (d - 0.035) / 0.195;
+    return 0.22 + Math.pow(1 - t, 1.35) * 0.72;
+  }
+  const shelfWave = Math.sin(nx * 19.0) * 0.025 + Math.cos(nx * 37.0) * 0.012;
+  return 0.16 + shelfWave;
+}
+
+function startCanvas() {
+  const canvas = canvasRef.value;
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+
+  let width = 0;
+  let height = 0;
+  let dpr = 1;
+
+  const terrainCols = 140;
+  const terrainRows = 46;
+  const terrainPoints = [];
+  for (let r = 0; r < terrainRows; r++) {
+    const rowNorm = r / (terrainRows - 1);
+    for (let c = 0; c < terrainCols; c++) {
+      const colNorm = c / (terrainCols - 1);
+      const seed = Math.sin(r * 127.1 + c * 311.7) * 43758.5453;
+      const rand = seed - Math.floor(seed);
+      const seed2 = Math.sin(r * 269.5 + c * 183.3) * 28461.712;
+      const rand2 = seed2 - Math.floor(seed2);
+
+      terrainPoints.push({
+        nx: colNorm + (rand - 0.5) * 0.008,
+        z: rowNorm,
+        ridgeNoise:
+          Math.sin(colNorm * 28 + rowNorm * 6) * 0.014 +
+          Math.cos(colNorm * 65 - rowNorm * 9) * 0.007 +
+          (rand2 - 0.5) * 0.012,
+        size: (1 - rowNorm * 0.55) * (1.1 + rand * 1.1),
+        alpha: (1 - rowNorm * 0.72) * (0.35 + rand2 * 0.65),
+      });
+    }
+  }
+
+  const waterMotes = Array.from({ length: 75 }, (_, i) => ({
+    x: (i * 0.6180339) % 1,
+    y: Math.random(),
+    speed: 0.0004 + (i % 7) * 0.00012,
+    size: 0.8 + (i % 3) * 0.6,
+    phase: i * 1.3,
+  }));
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    width = window.innerWidth;
+    height = window.innerHeight;
+    canvas.width = width * dpr;
+    canvas.height = height * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  resize();
+  window.addEventListener("resize", resize);
+
+  let smoothedFill = fillRatio.value;
+
+  function render() {
+    smoothedFill += (fillRatio.value - smoothedFill) * 0.04;
+    currentTilt += (targetTilt - currentTilt) * 0.08;
+    wavePhase += 0.025;
+
+    const bgGrad = ctx.createRadialGradient(
+      width * 0.5,
+      height * 0.12,
+      10,
+      width * 0.5,
+      height * 0.55,
+      Math.max(width, height) * 0.85,
+    );
+    bgGrad.addColorStop(0, "#0c2342");
+    bgGrad.addColorStop(0.55, "#061326");
+    bgGrad.addColorStop(1, "#020813");
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, width, height);
+
+    const topMargin = height * 0.14;
+    const bottomMargin = height * 0.93;
+    const trenchSpanY = bottomMargin - topMargin;
+
+    const baseWaterY = bottomMargin - smoothedFill * trenchSpanY;
+    const waterYAt = (screenX) => {
+      const relX = screenX - width * 0.5;
+      const tiltOffset = Math.tan(currentTilt) * relX;
+      const wave1 = Math.sin(screenX * 0.012 + wavePhase) * 4.5;
+      const wave2 = Math.cos(screenX * 0.027 - wavePhase * 1.4) * 2.2;
+      return baseWaterY + tiltOffset + wave1 + wave2;
+    };
+
+    // 1. Submerged water volume
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(0, height);
+    for (let x = 0; x <= width; x += 12) {
+      ctx.lineTo(x, waterYAt(x));
+    }
+    ctx.lineTo(width, height);
+    ctx.closePath();
+
+    const waterGrad = ctx.createLinearGradient(0, baseWaterY - 30, 0, height);
+    waterGrad.addColorStop(0, "rgba(34, 211, 238, 0.24)");
+    waterGrad.addColorStop(0.25, "rgba(14, 116, 144, 0.18)");
+    waterGrad.addColorStop(1, "rgba(3, 25, 48, 0.55)");
+    ctx.fillStyle = waterGrad;
+    ctx.fill();
+    ctx.restore();
+
+    // 2. Point-cloud Mariana Trench bathymetry
+    for (let i = 0; i < terrainPoints.length; i++) {
+      const p = terrainPoints[i];
+      const perspectiveX = 0.5 + (p.nx - 0.5) * (1 - p.z * 0.14);
+      const sx = perspectiveX * width;
+      const depthNorm = trenchDepthAt(p.nx) + p.ridgeNoise;
+      const sy = topMargin + depthNorm * trenchSpanY - p.z * (height * 0.065);
+
+      if (sy > height + 4) continue;
+
+      const wy = waterYAt(sx);
+      if (sy >= wy) {
+        ctx.fillStyle = `rgba(56, 232, 255, ${Math.min(0.95, p.alpha * 1.15)})`;
+      } else {
+        ctx.fillStyle = `rgba(96, 165, 250, ${p.alpha * 0.42})`;
+      }
+
+      ctx.fillRect(sx, sy, p.size, p.size);
+    }
+
+    // 3. Luminous waterline crest
+    ctx.save();
+    ctx.beginPath();
+    for (let x = 0; x <= width; x += 4) {
+      const y = waterYAt(x);
+      if (x === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = "rgba(103, 232, 249, 0.75)";
+    ctx.lineWidth = 1.6;
+    ctx.shadowColor = "#22d3ee";
+    ctx.shadowBlur = 12;
+    ctx.stroke();
+
+    for (let x = 6; x < width; x += 14) {
+      const y = waterYAt(x) + Math.sin(x * 0.2 + wavePhase * 2) * 2;
+      ctx.fillStyle = "rgba(186, 230, 253, 0.85)";
+      ctx.fillRect(x, y - 1, 1.8, 1.8);
+    }
+    ctx.restore();
+
+    // 4. Rising submerged motes
+    for (const m of waterMotes) {
+      m.y -= m.speed;
+      if (m.y < 0) m.y = 1;
+      const mx = m.x * width + Math.sin(wavePhase + m.phase) * 8;
+      const wy = waterYAt(mx);
+      const my = wy + m.y * Math.max(10, height - wy);
+      if (my > wy + 4 && my < height) {
+        ctx.fillStyle = "rgba(125, 211, 252, 0.35)";
+        ctx.fillRect(mx, my, m.size, m.size);
+      }
+    }
+
+    // 5. Left bathymetric depth scale ticks
+    const ticks = [0, 2000, 4000, 6000, 8000, 10000, 11034];
+    ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
+    ctx.textAlign = "left";
+    for (const depth of ticks) {
+      const ty = topMargin + (depth / MAX_DEPTH_M) * trenchSpanY;
+      ctx.fillStyle = "rgba(148, 163, 184, 0.45)";
+      ctx.fillRect(14, ty, 10, 1);
+      ctx.fillText(`${depth}m`, 28, ty + 3);
+    }
+
+    animFrameId = requestAnimationFrame(render);
+  }
+
+  animFrameId = requestAnimationFrame(render);
+
+  return () => {
+    window.removeEventListener("resize", resize);
+    if (animFrameId) cancelAnimationFrame(animFrameId);
+  };
 }
 
 onMounted(() => {
   fetchHistory();
   connectWS();
+  cleanupCanvas = startCanvas();
+
+  if (typeof window !== "undefined") {
+    window.addEventListener("mousemove", handleMouseMove);
+    if (
+      typeof DeviceOrientationEvent !== "undefined" &&
+      typeof DeviceOrientationEvent.requestPermission === "function"
+    ) {
+      needsGyroPermission.value = true;
+    } else if ("DeviceOrientationEvent" in window) {
+      window.addEventListener("deviceorientation", handleOrientation);
+    }
+  }
 });
 
 onUnmounted(() => {
+  if (cleanupCanvas) cleanupCanvas();
   if (reconnectTimer) clearTimeout(reconnectTimer);
-  socket?.close();
+  ws?.close();
+  window.removeEventListener("mousemove", handleMouseMove);
+  window.removeEventListener("deviceorientation", handleOrientation);
 });
+
+function statusLabel(status) {
+  switch (status) {
+    case "pending":
+      return "QUEUED";
+    case "processing":
+      return "GENERATING";
+    case "ollama_done":
+    case "delivered":
+      return "MEASURED";
+    case "failed":
+      return "FAILED";
+    default:
+      return status?.toUpperCase() || "QUEUED";
+  }
+}
+
+function badgeClasses(status) {
+  switch (status) {
+    case "pending":
+      return "bg-amber-500/20 text-amber-300 border-amber-500/40";
+    case "processing":
+      return "bg-cyan-400/20 text-cyan-300 border-cyan-400/50";
+    case "ollama_done":
+    case "delivered":
+      return "bg-emerald-500/15 text-emerald-300 border-emerald-500/35";
+    case "failed":
+      return "bg-red-500/20 text-red-300 border-red-500/40";
+    default:
+      return "bg-slate-500/20 text-slate-300 border-slate-500/35";
+  }
+}
 </script>
 
 <template>
-  <div class="flex h-dvh flex-col bg-zinc-950 text-zinc-100 antialiased">
-    <header class="border-b border-zinc-800/80 bg-zinc-950/90 backdrop-blur">
-      <div class="mx-auto flex max-w-4xl items-center justify-between px-4 py-3.5">
-        <div class="flex items-center gap-2.5">
+  <div
+    class="relative flex h-dvh w-screen flex-col overflow-hidden bg-[#020813] text-slate-200 antialiased"
+  >
+    <!-- Full-screen Point-Cloud Mariana Trench Canvas -->
+    <canvas ref="canvasRef" class="pointer-events-none fixed inset-0 z-0 h-full w-full"></canvas>
+
+    <!-- Top Bathymetric Telemetry Header -->
+    <header
+      class="relative z-10 flex items-center justify-between gap-3 bg-gradient-to-b from-[#020813]/90 to-transparent px-4 py-3.5 sm:px-6"
+    >
+      <div>
+        <div class="flex items-center gap-2">
           <span
-            class="h-2.5 w-2.5 rounded-full transition-colors"
-            :class="wsConnected ? 'bg-emerald-500 shadow-[0_0_8px_#10b981]' : 'bg-red-500'"
-          />
-          <h1 class="text-base font-semibold tracking-tight">Hackathon AI</h1>
+            class="h-2 w-2 rounded-full transition-all"
+            :class="
+              wsConnected
+                ? 'bg-cyan-400 shadow-[0_0_10px_#22d3ee]'
+                : 'bg-red-500 shadow-[0_0_8px_#ef4444]'
+            "
+          ></span>
+          <h1 class="text-sm font-bold tracking-[0.16em] text-slate-50 sm:text-base">
+            MARIANA TRENCH
+          </h1>
+        </div>
+        <p class="mt-0.5 font-mono text-[11px] tracking-[0.14em] text-sky-300">
+          AI WATER FOOTPRINT · DEPTH {{ currentDepthMeters.toLocaleString() }}m
+        </p>
+      </div>
+
+      <div class="flex items-center gap-3">
+        <div
+          class="flex items-center gap-3 rounded-full border border-sky-400/30 bg-[#061428]/75 px-3.5 py-1.5 backdrop-blur-md"
+        >
+          <div class="flex flex-col items-end">
+            <span class="text-[9px] tracking-[0.12em] text-slate-400">WATER USED</span>
+            <span class="font-mono text-sm font-bold text-cyan-400">
+              {{ totalWaterMl.toFixed(3) }} <span class="text-xs font-medium">mL</span>
+            </span>
+          </div>
+          <div class="h-5 w-px bg-slate-400/25"></div>
+          <div class="flex flex-col items-end">
+            <span class="text-[9px] tracking-[0.12em] text-slate-400">TOKENS</span>
+            <span class="font-mono text-sm font-bold text-slate-100">
+              {{ totalTokens.toLocaleString() }}
+            </span>
+          </div>
         </div>
 
-        <div class="flex items-center gap-2 text-xs text-zinc-400 tabular-nums">
-          <span class="rounded-full border border-zinc-800 bg-zinc-900 px-3 py-1">
-            Tokens In: <strong class="font-semibold text-zinc-100">{{ totalTokens.in }}</strong>
-          </span>
-          <span class="rounded-full border border-zinc-800 bg-zinc-900 px-3 py-1">
-            Tokens Out: <strong class="font-semibold text-zinc-100">{{ totalTokens.out }}</strong>
-          </span>
-        </div>
+        <button
+          v-if="needsGyroPermission"
+          type="button"
+          class="cursor-pointer rounded-lg border border-cyan-400/45 bg-cyan-700/35 px-2.5 py-1.5 text-xs font-medium text-cyan-100 hover:bg-cyan-700/55"
+          @click="requestGyroPermission"
+        >
+          Enable Tilt
+        </button>
       </div>
     </header>
 
-    <!-- Chat Stream -->
-    <main ref="chatContainer" class="flex-1 overflow-y-auto">
-      <div class="mx-auto flex min-h-full max-w-4xl flex-col gap-6 px-4 py-6">
-        <div v-if="messages.length === 0" class="my-auto mx-auto max-w-md text-center">
-          <h2 class="mb-2 text-lg font-semibold text-zinc-100">
-            Ask anything to drive the installation
-          </h2>
-          <p class="text-sm leading-relaxed text-zinc-400">
-            Prompts are queued sequentially, processed via Ollama, and streamed as token telemetry
-            to TouchDesigner.
+    <!-- Bottom-Up Prompt & Water Cost Stream (No LLM Answers Displayed) -->
+    <main
+      class="relative z-5 flex flex-1 flex-col-reverse overflow-y-auto pt-3 pr-4 pb-2 pl-14 [mask-image:linear-gradient(to_bottom,transparent_0%,black_14%,black_100%)] [-webkit-mask-image:linear-gradient(to_bottom,transparent_0%,black_14%,black_100%)]"
+    >
+      <div class="mx-auto flex w-full max-w-2xl flex-col-reverse gap-2.5">
+        <article
+          v-for="item in bottomUpMessages"
+          :key="item.id"
+          class="rounded-xl border bg-[#061326]/70 px-3.5 py-2.5 backdrop-blur-md transition-all duration-200"
+          :class="[
+            item.status === 'processing'
+              ? 'border-cyan-400/65 shadow-[0_0_18px_rgba(34,211,238,0.14)]'
+              : item.status === 'failed'
+                ? 'border-red-400/50'
+                : 'border-sky-400/20',
+          ]"
+        >
+          <div class="mb-1.5 flex items-center justify-between gap-2">
+            <span
+              class="rounded-full border px-2 py-0.5 font-mono text-[10px] font-bold tracking-[0.1em]"
+              :class="badgeClasses(item.status)"
+            >
+              {{ statusLabel(item.status) }}
+            </span>
+
+            <span
+              v-if="item.status === 'ollama_done' || item.status === 'delivered'"
+              class="font-mono text-xs text-slate-400"
+            >
+              {{ (item.tokens_in || 0) + (item.tokens_out || 0) }} tok
+              <span class="mx-1 opacity-50">·</span>
+              <strong class="font-bold text-cyan-400">
+                +{{ Number(item.water_cost_ml || 0).toFixed(3) }} mL
+              </strong>
+            </span>
+
+            <span
+              v-else-if="item.status === 'processing'"
+              class="animate-pulse font-mono text-xs text-cyan-300"
+            >
+              calculating tokens...
+            </span>
+          </div>
+
+          <p class="break-words text-sm leading-snug text-slate-100">
+            {{ item.prompt }}
           </p>
-        </div>
-
-        <div v-for="item in messages" :key="item.id" class="flex flex-col gap-3">
-          <!-- User Bubble -->
-          <div class="flex justify-end">
-            <div
-              class="max-w-[78%] whitespace-pre-wrap rounded-2xl border border-zinc-700/70 bg-zinc-800/90 px-4 py-3 text-sm leading-relaxed text-zinc-100"
-            >
-              {{ item.prompt }}
-            </div>
-          </div>
-
-          <!-- Assistant Bubble -->
-          <div class="flex items-start gap-3">
-            <div
-              class="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-blue-600 text-xs font-bold text-white"
-            >
-              AI
-            </div>
-
-            <div
-              class="w-full rounded-2xl border border-zinc-800 bg-zinc-900/90 px-4 py-3 text-sm leading-relaxed"
-            >
-              <div class="mb-2 flex items-center justify-between text-xs">
-                <span
-                  class="rounded px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider"
-                  :class="statusMeta(item.status).classes"
-                >
-                  {{ statusMeta(item.status).label }}
-                </span>
-
-                <span v-if="item.tokens_in || item.tokens_out" class="text-zinc-400 tabular-nums">
-                  {{ item.tokens_in }} in · {{ item.tokens_out }} out
-                </span>
-              </div>
-
-              <div v-if="item.response" class="whitespace-pre-wrap text-zinc-100">
-                {{ item.response }}
-              </div>
-
-              <div
-                v-else-if="item.status === 'processing'"
-                class="flex items-center gap-1.5 py-1.5"
-              >
-                <span
-                  class="h-2 w-2 animate-bounce rounded-full bg-zinc-400 [animation-delay:-0.3s]"
-                />
-                <span
-                  class="h-2 w-2 animate-bounce rounded-full bg-zinc-400 [animation-delay:-0.15s]"
-                />
-                <span class="h-2 w-2 animate-bounce rounded-full bg-zinc-400" />
-              </div>
-
-              <div v-else class="italic text-zinc-500">Waiting in queue...</div>
-            </div>
-          </div>
-        </div>
+        </article>
       </div>
     </main>
 
-    <!-- Prompt Composer -->
-    <footer class="border-t border-zinc-800/80 bg-zinc-950 px-4 py-4">
-      <form
-        class="mx-auto flex max-w-4xl items-end gap-2.5 rounded-2xl border border-zinc-800 bg-zinc-900 p-2 focus-within:border-zinc-700"
-        @submit.prevent="sendPrompt"
-      >
-        <textarea
-          v-model="inputPrompt"
-          rows="1"
-          placeholder="Send a prompt to the queue... (Enter to send, Shift+Enter for newline)"
-          class="max-h-36 flex-1 resize-none bg-transparent px-2.5 py-1.5 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none"
-          @keydown="handleKeydown"
+    <!-- Bottom Prompt Input Bar -->
+    <footer
+      class="relative z-10 bg-gradient-to-t from-[#020813]/95 via-[#020813]/75 to-transparent px-4 pt-2.5 pb-[calc(0.875rem+env(safe-area-inset-bottom))]"
+    >
+      <form class="mx-auto flex w-full max-w-2xl gap-2" @submit.prevent="submitPrompt">
+        <input
+          v-model="promptInput"
+          type="text"
+          placeholder="Send a prompt to measure its water cost..."
+          :disabled="isSubmitting"
+          autocomplete="off"
+          class="flex-1 rounded-xl border border-sky-400/35 bg-[#07162b]/85 px-4 py-3 text-sm text-slate-50 placeholder-slate-500 backdrop-blur-md outline-none transition focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/20 disabled:opacity-50"
         />
         <button
           type="submit"
-          :disabled="!wsConnected || !inputPrompt.trim()"
-          class="rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-40"
+          :disabled="isSubmitting || !promptInput.trim()"
+          class="cursor-pointer rounded-xl border border-cyan-400/55 bg-gradient-to-br from-cyan-600 to-sky-600 px-5 text-xs font-bold tracking-[0.1em] text-slate-50 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
         >
-          Send
+          {{ isSubmitting ? "..." : "SEND" }}
         </button>
       </form>
     </footer>
