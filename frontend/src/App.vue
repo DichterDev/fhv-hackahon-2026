@@ -173,7 +173,6 @@ function handleOrientation(e: DeviceOrientationEvent) {
   if (e.gamma === null) return;
   gyroEnabled.value = true;
   const clamped = Math.max(-45, Math.min(45, e.gamma));
-  // Negative sign keeps water level with gravity: tilting right-down raises water on the right
   targetTilt = -(clamped / 45) * 0.28;
 }
 
@@ -201,7 +200,7 @@ async function requestGyroPermission() {
   }
 }
 
-// --- Point-Cloud Mariana Trench & Rising Water Renderer ---
+// --- Optimized Offscreen-Cached Point-Cloud Renderer ---
 function trenchDepthAt(nx: number): number {
   const d = Math.abs(nx - 0.47);
   if (d < 0.035) {
@@ -218,15 +217,20 @@ function trenchDepthAt(nx: number): number {
 function startCanvas(): (() => void) | null {
   const canvas = canvasRef.value;
   if (!canvas) return null;
-  const ctx = canvas.getContext("2d");
+  const ctx = canvas.getContext("2d", { alpha: false });
   if (!ctx) return null;
 
   let width = 0;
   let height = 0;
   let dpr = 1;
 
-  const terrainCols = 140;
-  const terrainRows = 46;
+  // Offscreen cached layers (rendered ONLY on resize, blitted in 1 draw call per frame)
+  const bgLayer = document.createElement("canvas");
+  const dryTerrainLayer = document.createElement("canvas");
+  const wetTerrainLayer = document.createElement("canvas");
+
+  const terrainCols = 110;
+  const terrainRows = 36;
   const terrainPoints: Array<{
     nx: number;
     z: number;
@@ -257,36 +261,30 @@ function startCanvas(): (() => void) | null {
     }
   }
 
-  const waterMotes = Array.from({ length: 75 }, (_, i) => ({
+  const waterMotes = Array.from({ length: 42 }, (_, i) => ({
     x: (i * 0.6180339) % 1,
     y: Math.random(),
-    speed: 0.0004 + (i % 7) * 0.00012,
-    size: 0.8 + (i % 3) * 0.6,
+    speed: 0.0005 + (i % 7) * 0.00014,
+    size: 1.0 + (i % 3) * 0.5,
     phase: i * 1.3,
   }));
 
-  function resize() {
-    if (!canvas || !ctx) return;
-    dpr = Math.min(window.devicePixelRatio || 1, 2);
-    width = window.innerWidth;
-    height = window.innerHeight;
-    canvas.width = width * dpr;
-    canvas.height = height * dpr;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  }
+  let cachedWaterGrad: CanvasGradient | null = null;
+  let lastGradY = -1;
 
-  resize();
-  window.addEventListener("resize", resize);
+  function rebuildStaticLayers() {
+    const pw = Math.round(width * dpr);
+    const ph = Math.round(height * dpr);
 
-  let smoothedFill = fillRatio.value;
+    for (const layer of [bgLayer, dryTerrainLayer, wetTerrainLayer]) {
+      layer.width = pw;
+      layer.height = ph;
+    }
 
-  function render() {
-    if (!ctx) return;
-    smoothedFill += (fillRatio.value - smoothedFill) * 0.04;
-    currentTilt += (targetTilt - currentTilt) * 0.08;
-    wavePhase += 0.025;
-
-    const bgGrad = ctx.createRadialGradient(
+    // 1. Static background gradient + depth scale ticks
+    const bgCtx = bgLayer.getContext("2d")!;
+    bgCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const bgGrad = bgCtx.createRadialGradient(
       width * 0.5,
       height * 0.12,
       10,
@@ -297,107 +295,149 @@ function startCanvas(): (() => void) | null {
     bgGrad.addColorStop(0, "#0c2342");
     bgGrad.addColorStop(0.55, "#061326");
     bgGrad.addColorStop(1, "#020813");
-    ctx.fillStyle = bgGrad;
-    ctx.fillRect(0, 0, width, height);
+    bgCtx.fillStyle = bgGrad;
+    bgCtx.fillRect(0, 0, width, height);
 
     const topMargin = height * 0.14;
     const bottomMargin = height * 0.93;
     const trenchSpanY = bottomMargin - topMargin;
 
+    const ticks = [0, 2000, 4000, 6000, 8000, 10000, 11034];
+    bgCtx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
+    bgCtx.textAlign = "left";
+    for (const depth of ticks) {
+      const ty = topMargin + (depth / MAX_DEPTH_M) * trenchSpanY;
+      bgCtx.fillStyle = "rgba(148, 163, 184, 0.45)";
+      bgCtx.fillRect(14, ty, 10, 1);
+      bgCtx.fillText(`${depth}m`, 28, ty + 3);
+    }
+
+    // 2. Pre-render dry (above water) & wet (submerged) point clouds once
+    const dryCtx = dryTerrainLayer.getContext("2d")!;
+    const wetCtx = wetTerrainLayer.getContext("2d")!;
+    dryCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    wetCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    dryCtx.fillStyle = "#60a5fa";
+    wetCtx.fillStyle = "#38e8ff";
+
+    for (let i = 0; i < terrainPoints.length; i++) {
+      const p = terrainPoints[i]!;
+      const perspectiveX = 0.5 + (p.nx - 0.5) * (1 - p.z * 0.14);
+      const sx = perspectiveX * width;
+      const depthNorm = trenchDepthAt(p.nx) + p.ridgeNoise;
+      const sy = topMargin + depthNorm * trenchSpanY - p.z * (height * 0.065);
+      if (sy > height + 4) continue;
+
+      dryCtx.globalAlpha = p.alpha * 0.42;
+      dryCtx.fillRect(sx, sy, p.size, p.size);
+
+      wetCtx.globalAlpha = Math.min(0.95, p.alpha * 1.15);
+      wetCtx.fillRect(sx, sy, p.size, p.size);
+    }
+    dryCtx.globalAlpha = 1;
+    wetCtx.globalAlpha = 1;
+    lastGradY = -1;
+  }
+
+  function resize() {
+    if (!canvas || !ctx) return;
+    // Cap DPR at 1.25 to keep iGPU fill-rate low while staying crisp
+    dpr = Math.min(window.devicePixelRatio || 1, 1.25);
+    width = window.innerWidth;
+    height = window.innerHeight;
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    rebuildStaticLayers();
+  }
+
+  resize();
+  window.addEventListener("resize", resize);
+
+  let smoothedFill = fillRatio.value;
+  let lastFrameTime = 0;
+  const FRAME_INTERVAL = 1000 / 36; // ~36 FPS cap: smooth waves at half the GPU cost
+
+  function render(now: number) {
+    animFrameId = requestAnimationFrame(render);
+    if (now - lastFrameTime < FRAME_INTERVAL) return;
+    lastFrameTime = now;
+
+    if (!ctx) return;
+    smoothedFill += (fillRatio.value - smoothedFill) * 0.05;
+    currentTilt += (targetTilt - currentTilt) * 0.1;
+    wavePhase += 0.035;
+
+    const topMargin = height * 0.14;
+    const bottomMargin = height * 0.93;
+    const trenchSpanY = bottomMargin - topMargin;
     const baseWaterY = bottomMargin - smoothedFill * trenchSpanY;
+    const tanTilt = Math.tan(currentTilt);
+    const halfW = width * 0.5;
+
     const waterYAt = (screenX: number) => {
-      const relX = screenX - width * 0.5;
-      const tiltOffset = Math.tan(currentTilt) * relX;
+      const tiltOffset = tanTilt * (screenX - halfW);
       const wave1 = Math.sin(screenX * 0.012 + wavePhase) * 4.5;
       const wave2 = Math.cos(screenX * 0.027 - wavePhase * 1.4) * 2.2;
       return baseWaterY + tiltOffset + wave1 + wave2;
     };
 
-    // 1. Submerged water volume
+    // 1. Blit cached background + dry point cloud in 2 fast GPU copies
+    ctx.drawImage(bgLayer, 0, 0, width, height);
+    ctx.drawImage(dryTerrainLayer, 0, 0, width, height);
+
+    // 2. Build water surface path once & clip submerged water + glowing wet point cloud
     ctx.save();
     ctx.beginPath();
     ctx.moveTo(0, height);
-    for (let x = 0; x <= width; x += 12) {
+    for (let x = 0; x <= width; x += 16) {
       ctx.lineTo(x, waterYAt(x));
     }
+    ctx.lineTo(width, waterYAt(width));
     ctx.lineTo(width, height);
     ctx.closePath();
+    ctx.clip();
 
-    const waterGrad = ctx.createLinearGradient(0, baseWaterY - 30, 0, height);
-    waterGrad.addColorStop(0, "rgba(34, 211, 238, 0.24)");
-    waterGrad.addColorStop(0.25, "rgba(14, 116, 144, 0.18)");
-    waterGrad.addColorStop(1, "rgba(3, 25, 48, 0.55)");
-    ctx.fillStyle = waterGrad;
-    ctx.fill();
-    ctx.restore();
-
-    // 2. Point-cloud Mariana Trench bathymetry
-    for (let i = 0; i < terrainPoints.length; i++) {
-      const p = terrainPoints[i];
-      if (!p) continue;
-      const perspectiveX = 0.5 + (p.nx - 0.5) * (1 - p.z * 0.14);
-      const sx = perspectiveX * width;
-      const depthNorm = trenchDepthAt(p.nx) + p.ridgeNoise;
-      const sy = topMargin + depthNorm * trenchSpanY - p.z * (height * 0.065);
-
-      if (sy > height + 4) continue;
-
-      const wy = waterYAt(sx);
-      if (sy >= wy) {
-        ctx.fillStyle = `rgba(56, 232, 255, ${Math.min(0.95, p.alpha * 1.15)})`;
-      } else {
-        ctx.fillStyle = `rgba(96, 165, 250, ${p.alpha * 0.42})`;
-      }
-
-      ctx.fillRect(sx, sy, p.size, p.size);
+    if (!cachedWaterGrad || Math.abs(baseWaterY - lastGradY) > 2) {
+      cachedWaterGrad = ctx.createLinearGradient(0, baseWaterY - 30, 0, height);
+      cachedWaterGrad.addColorStop(0, "rgba(34, 211, 238, 0.24)");
+      cachedWaterGrad.addColorStop(0.25, "rgba(14, 116, 144, 0.18)");
+      cachedWaterGrad.addColorStop(1, "rgba(3, 25, 48, 0.55)");
+      lastGradY = baseWaterY;
     }
+    ctx.fillStyle = cachedWaterGrad;
+    ctx.fillRect(0, 0, width, height);
 
-    // 3. Luminous waterline crest
-    ctx.save();
-    ctx.beginPath();
-    for (let x = 0; x <= width; x += 4) {
-      const y = waterYAt(x);
-      if (x === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.strokeStyle = "rgba(103, 232, 249, 0.75)";
-    ctx.lineWidth = 1.6;
-    ctx.shadowColor = "#22d3ee";
-    ctx.shadowBlur = 12;
-    ctx.stroke();
+    // Blit pre-rendered submerged cyan point cloud inside water clip
+    ctx.drawImage(wetTerrainLayer, 0, 0, width, height);
 
-    for (let x = 6; x < width; x += 14) {
-      const y = waterYAt(x) + Math.sin(x * 0.2 + wavePhase * 2) * 2;
-      ctx.fillStyle = "rgba(186, 230, 253, 0.85)";
-      ctx.fillRect(x, y - 1, 1.8, 1.8);
-    }
-    ctx.restore();
-
-    // 4. Rising submerged motes
+    // Rising submerged motes (clipped automatically to water volume)
+    ctx.fillStyle = "rgba(125, 211, 252, 0.35)";
     for (const m of waterMotes) {
       m.y -= m.speed;
       if (m.y < 0) m.y = 1;
       const mx = m.x * width + Math.sin(wavePhase + m.phase) * 8;
       const wy = waterYAt(mx);
       const my = wy + m.y * Math.max(10, height - wy);
-      if (my > wy + 4 && my < height) {
-        ctx.fillStyle = "rgba(125, 211, 252, 0.35)";
-        ctx.fillRect(mx, my, m.size, m.size);
-      }
+      ctx.fillRect(mx, my, m.size, m.size);
     }
+    ctx.restore();
 
-    // 5. Left bathymetric depth scale ticks
-    const ticks = [0, 2000, 4000, 6000, 8000, 10000, 11034];
-    ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
-    ctx.textAlign = "left";
-    for (const depth of ticks) {
-      const ty = topMargin + (depth / MAX_DEPTH_M) * trenchSpanY;
-      ctx.fillStyle = "rgba(148, 163, 184, 0.45)";
-      ctx.fillRect(14, ty, 10, 1);
-      ctx.fillText(`${depth}m`, 28, ty + 3);
+    // 3. Fast waterline crest (no expensive shadowBlur)
+    ctx.beginPath();
+    for (let x = 0; x <= width; x += 12) {
+      const y = waterYAt(x);
+      if (x === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
     }
+    ctx.strokeStyle = "rgba(34, 211, 238, 0.25)";
+    ctx.lineWidth = 6;
+    ctx.stroke();
 
-    animFrameId = requestAnimationFrame(render);
+    ctx.strokeStyle = "rgba(103, 232, 249, 0.8)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
   }
 
   animFrameId = requestAnimationFrame(render);
