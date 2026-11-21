@@ -224,7 +224,6 @@ function startCanvas(): (() => void) | null {
   let height = 0;
   let dpr = 1;
 
-  // Offscreen cached layers (rendered ONLY on resize, blitted in 1 draw call per frame)
   const bgLayer = document.createElement("canvas");
   const dryTerrainLayer = document.createElement("canvas");
   const wetTerrainLayer = document.createElement("canvas");
@@ -281,7 +280,6 @@ function startCanvas(): (() => void) | null {
       layer.height = ph;
     }
 
-    // 1. Static background gradient + depth scale ticks
     const bgCtx = bgLayer.getContext("2d")!;
     bgCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const bgGrad = bgCtx.createRadialGradient(
@@ -312,7 +310,6 @@ function startCanvas(): (() => void) | null {
       bgCtx.fillText(`${depth}m`, 28, ty + 3);
     }
 
-    // 2. Pre-render dry (above water) & wet (submerged) point clouds once
     const dryCtx = dryTerrainLayer.getContext("2d")!;
     const wetCtx = wetTerrainLayer.getContext("2d")!;
     dryCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -342,7 +339,6 @@ function startCanvas(): (() => void) | null {
 
   function resize() {
     if (!canvas || !ctx) return;
-    // Cap DPR at 1.25 to keep iGPU fill-rate low while staying crisp
     dpr = Math.min(window.devicePixelRatio || 1, 1.25);
     width = window.innerWidth;
     height = window.innerHeight;
@@ -357,7 +353,7 @@ function startCanvas(): (() => void) | null {
 
   let smoothedFill = fillRatio.value;
   let lastFrameTime = 0;
-  const FRAME_INTERVAL = 1000 / 36; // ~36 FPS cap: smooth waves at half the GPU cost
+  const FRAME_INTERVAL = 1000 / 36;
 
   function render(now: number) {
     animFrameId = requestAnimationFrame(render);
@@ -383,11 +379,9 @@ function startCanvas(): (() => void) | null {
       return baseWaterY + tiltOffset + wave1 + wave2;
     };
 
-    // 1. Blit cached background + dry point cloud in 2 fast GPU copies
     ctx.drawImage(bgLayer, 0, 0, width, height);
     ctx.drawImage(dryTerrainLayer, 0, 0, width, height);
 
-    // 2. Build water surface path once & clip submerged water + glowing wet point cloud
     ctx.save();
     ctx.beginPath();
     ctx.moveTo(0, height);
@@ -409,10 +403,8 @@ function startCanvas(): (() => void) | null {
     ctx.fillStyle = cachedWaterGrad;
     ctx.fillRect(0, 0, width, height);
 
-    // Blit pre-rendered submerged cyan point cloud inside water clip
     ctx.drawImage(wetTerrainLayer, 0, 0, width, height);
 
-    // Rising submerged motes (clipped automatically to water volume)
     ctx.fillStyle = "rgba(125, 211, 252, 0.35)";
     for (const m of waterMotes) {
       m.y -= m.speed;
@@ -424,7 +416,6 @@ function startCanvas(): (() => void) | null {
     }
     ctx.restore();
 
-    // 3. Fast waterline crest (no expensive shadowBlur)
     ctx.beginPath();
     for (let x = 0; x <= width; x += 12) {
       const y = waterYAt(x);
@@ -555,7 +546,7 @@ function isCompleted(status: string): boolean {
       </div>
     </header>
 
-    <!-- Bottom-Up Prompt & Water Cost Stream (4/5 Prompt | 1/5 Tokens & mL) -->
+    <!-- Bottom-Up Prompt & Water Cost Stream (4/5 Prompt | 1/5 Centered Telemetry Compartment) -->
     <main
       class="relative z-5 flex flex-1 flex-col-reverse overflow-y-auto pt-3 pr-4 pb-2 pl-14 [mask-image:linear-gradient(to_bottom,transparent_0%,black_14%,black_100%)] [-webkit-mask-image:linear-gradient(to_bottom,transparent_0%,black_14%,black_100%)]"
     >
@@ -563,36 +554,39 @@ function isCompleted(status: string): boolean {
         <article
           v-for="item in bottomUpMessages"
           :key="item.id"
-          class="flex items-center rounded-xl border backdrop-blur-md transition-colors duration-300"
+          class="flex items-stretch overflow-hidden rounded-xl border backdrop-blur-md transition-colors duration-300"
           :class="cardClasses(item.status)"
         >
           <!-- 4/5 Width: Prompt Text -->
-          <div class="w-4/5 px-3.5 py-2.5">
+          <div class="flex w-4/5 items-center px-4 py-3">
             <p class="break-words text-sm leading-snug">
               {{ item.prompt }}
             </p>
           </div>
 
-          <!-- 1/5 Width: Tokens & Water Cost -->
+          <!-- 1/5 Width: Distinct Darker Inset Telemetry Compartment (Centered) -->
           <div
-            class="flex w-1/5 shrink-0 flex-col items-end justify-center self-stretch border-l border-white/10 px-2.5 py-2 text-right font-mono"
+            class="flex w-1/5 shrink-0 flex-col items-center justify-center border-l border-white/15 bg-black/30 px-2 py-2.5 text-center font-mono"
           >
             <template v-if="isCompleted(item.status)">
-              <span class="text-xs font-bold text-emerald-300">
-                +{{ Number(item.water_cost_ml || 0).toFixed(3) }}mL
+              <span
+                class="text-sm font-extrabold leading-tight tracking-tight text-emerald-200 sm:text-base"
+              >
+                +{{ Number(item.water_cost_ml || 0).toFixed(3)
+                }}<span class="ml-0.5 text-xs font-semibold text-emerald-300">mL</span>
               </span>
-              <span class="mt-0.5 text-[11px] text-emerald-200/75">
+              <span class="mt-1 text-xs font-medium leading-tight text-emerald-100/80">
                 {{ (item.tokens_in || 0) + (item.tokens_out || 0) }} tok
               </span>
             </template>
             <template v-else>
               <span
-                class="text-xs opacity-60"
-                :class="{ 'animate-pulse text-cyan-300 opacity-100': item.status === 'processing' }"
+                class="text-sm font-bold leading-tight opacity-65 sm:text-base"
+                :class="{ 'animate-pulse text-cyan-200 opacity-100': item.status === 'processing' }"
               >
                 — mL
               </span>
-              <span class="mt-0.5 text-[11px] opacity-50">— tok</span>
+              <span class="mt-1 text-xs font-medium leading-tight opacity-55">— tok</span>
             </template>
           </div>
         </article>
