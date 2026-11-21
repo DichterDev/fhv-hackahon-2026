@@ -16,10 +16,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
 	_ "modernc.org/sqlite"
 )
 
@@ -136,12 +136,6 @@ type App struct {
 	db      *sql.DB
 	hub     *Hub
 	notifyQ chan struct{}
-}
-
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
 func initDB(path string) (*sql.DB, error) {
@@ -389,50 +383,56 @@ func (a *App) deliverNextToTD(ctx context.Context, client *http.Client) bool {
 }
 
 func (a *App) handleWS(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		InsecureSkipVerify: true,
+	})
 	if err != nil {
 		return
 	}
-	sendCh := a.hub.register(conn)
+	defer conn.CloseNow()
 
+	conn.SetReadLimit(16384)
+	sendCh := a.hub.register(conn)
+	defer a.hub.unregister(conn)
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	// Writer & heartbeat ping loop
 	go func() {
 		pingTicker := time.NewTicker(25 * time.Second)
 		defer pingTicker.Stop()
-		defer conn.Close()
 
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case msg, ok := <-sendCh:
 				if !ok {
 					return
 				}
-				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				writeCtx, writeCancel := context.WithTimeout(ctx, 10*time.Second)
+				err := conn.Write(writeCtx, websocket.MessageText, msg)
+				writeCancel()
+				if err != nil {
+					cancel()
 					return
 				}
 			case <-pingTicker.C:
-				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				pingCtx, pingCancel := context.WithTimeout(ctx, 10*time.Second)
+				err := conn.Ping(pingCtx)
+				pingCancel()
+				if err != nil {
+					cancel()
 					return
 				}
 			}
 		}
 	}()
 
-	defer func() {
-		a.hub.unregister(conn)
-		conn.Close()
-	}()
-
-	conn.SetReadLimit(16384)
-	_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	conn.SetPongHandler(func(string) error {
-		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		return nil
-	})
-
+	// Reader loop
 	for {
-		_, raw, err := conn.ReadMessage()
+		_, raw, err := conn.Read(ctx)
 		if err != nil {
 			break
 		}
@@ -442,10 +442,12 @@ func (a *App) handleWS(w http.ResponseWriter, r *http.Request) {
 		if err := json.Unmarshal(raw, &incoming); err != nil || incoming.Prompt == "" {
 			continue
 		}
-		if _, err := a.enqueuePrompt(r.Context(), incoming.Prompt); err != nil {
+		if _, err := a.enqueuePrompt(ctx, incoming.Prompt); err != nil {
 			log.Printf("enqueue error: %v", err)
 		}
 	}
+
+	_ = conn.Close(websocket.StatusNormalClosure, "")
 }
 
 func (a *App) handleHistory(w http.ResponseWriter, r *http.Request) {
