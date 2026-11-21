@@ -12,9 +12,10 @@ interface PromptMessage {
 }
 
 // --- Config ---
-// Fixed pixel height per 1 mL step on the right-hand ruler (0 mL at bottom, scrolling up increases mL)
-const PX_PER_ML = 110;
-const MAX_DEPTH_M = 11034;
+// 10 mL major steps (110px per 10 mL step -> 11px per 1 mL), 0 mL anchored at bottom
+const ML_STEP = 10;
+const PX_PER_STEP = 110;
+const PX_PER_ML = PX_PER_STEP / ML_STEP;
 
 // --- State ---
 const messages = ref<PromptMessage[]>([]);
@@ -28,7 +29,7 @@ const needsGyroPermission = ref(false);
 let targetTilt = 0;
 let currentTilt = 0;
 let wavePhase = 0;
-let scrollOffsetPx = 0; // 0 = anchored at bottom (0 mL), positive = scrolled up into higher mL
+let scrollOffsetPx = 0;
 let animFrameId: number | null = null;
 let ws: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -37,7 +38,7 @@ let cleanupCanvas: (() => void) | null = null;
 const canvasRef = ref<HTMLCanvasElement | null>(null);
 const feedRef = ref<HTMLElement | null>(null);
 
-// --- Totals & Trench Depth Metrics ---
+// --- Totals ---
 const totalWaterMl = computed(() =>
   messages.value.reduce((sum, m) => sum + (Number(m.water_cost_ml) || 0), 0),
 );
@@ -49,19 +50,13 @@ const totalTokens = computed(() =>
   ),
 );
 
-const currentDepthMeters = computed(() => {
-  const ratio = Math.min(1, totalWaterMl.value / Math.max(5, Math.ceil(totalWaterMl.value + 1)));
-  return Math.round(MAX_DEPTH_M * (1 - ratio));
-});
-
 // Bottom-up order: newest messages sit at the bottom right above the composer
 const bottomUpMessages = computed(() => [...messages.value].reverse());
 
-// --- Scroll Sync Handler (scrolling up moves the mL ruler up) ---
+// --- Scroll Sync Handler ---
 function handleFeedScroll() {
   const el = feedRef.value;
   if (!el) return;
-  // In flex-col-reverse, scrollTop is 0 at bottom and becomes negative (or positive depending on browser) when scrolling up
   scrollOffsetPx = Math.abs(el.scrollTop);
 }
 
@@ -362,7 +357,7 @@ function startCanvas(): (() => void) | null {
     currentTilt += (targetTilt - currentTilt) * 0.1;
     wavePhase += 0.035;
 
-    // 0 mL baseline sits near the bottom above the input bar; scrolling up shifts the ruler & waterline down in screen space
+    // 0 mL baseline sits near the bottom above the input bar; scrolling up shifts the ruler & waterline down
     const zeroMlScreenY = height * 0.89 + scrollOffsetPx;
     const baseWaterY = zeroMlScreenY - smoothedWaterMl * PX_PER_ML;
     const tanTilt = Math.tan(currentTilt);
@@ -415,7 +410,7 @@ function startCanvas(): (() => void) | null {
     }
     ctx.restore();
 
-    // 3. Luminous waterline crest (aligned to exact mL mark at the right edge)
+    // 3. Luminous waterline crest
     ctx.beginPath();
     for (let x = 0; x <= width; x += 12) {
       const y = waterYAt(x);
@@ -430,28 +425,29 @@ function startCanvas(): (() => void) | null {
     ctx.lineWidth = 1.5;
     ctx.stroke();
 
-    // 4. Dynamic Right-Side Cyan Height Markers (1 mL steps, 0 mL at bottom, scrolling up with feed)
-    const maxVisibleMl = Math.max(
-      Math.ceil(smoothedWaterMl) + 4,
-      Math.ceil((zeroMlScreenY + 40) / PX_PER_ML),
+    // 4. Dynamic Right-Side Cyan Height Markers (10 mL steps, 0 mL at bottom, scrolling up with feed)
+    const maxVisibleStep = Math.max(
+      Math.ceil(smoothedWaterMl / ML_STEP) + 4,
+      Math.ceil((zeroMlScreenY + 40) / PX_PER_STEP),
     );
-    const minVisibleMl = Math.max(0, Math.floor((zeroMlScreenY - height - 40) / PX_PER_ML));
+    const minVisibleStep = Math.max(0, Math.floor((zeroMlScreenY - height - 40) / PX_PER_STEP));
 
     ctx.font = "600 11px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.textAlign = "right";
 
-    for (let ml = minVisibleMl; ml <= maxVisibleMl; ml++) {
-      const ty = zeroMlScreenY - ml * PX_PER_ML;
+    for (let step = minVisibleStep; step <= maxVisibleStep; step++) {
+      const ml = step * ML_STEP;
+      const ty = zeroMlScreenY - step * PX_PER_STEP;
       if (ty < -20 || ty > height + 20) continue;
 
       const isSubmerged = ml <= smoothedWaterMl + 0.001;
-      // Major 1 mL tick on the right edge
+      // Major 10 mL tick on the right edge
       ctx.fillStyle = isSubmerged ? "rgba(34, 211, 238, 0.95)" : "rgba(34, 211, 238, 0.55)";
       ctx.fillRect(width - 24, ty, 14, 1.5);
       ctx.fillText(`${ml} mL`, width - 30, ty + 3.5);
 
-      // Half-mL minor tick (0.5 mL)
-      const halfY = ty - PX_PER_ML * 0.5;
+      // Half-step minor tick (5 mL)
+      const halfY = ty - PX_PER_STEP * 0.5;
       if (halfY >= -20 && halfY <= height + 20) {
         ctx.fillStyle = "rgba(34, 211, 238, 0.3)";
         ctx.fillRect(width - 17, halfY, 7, 1);
@@ -530,62 +526,51 @@ function isCompleted(status: string): boolean {
     <!-- Full-screen Point-Cloud Mariana Trench Canvas -->
     <canvas ref="canvasRef" class="pointer-events-none fixed inset-0 z-0 h-full w-full"></canvas>
 
-    <!-- Top Bathymetric Telemetry Header -->
+    <!-- Centered Total Usage Telemetry Header -->
     <header
-      class="relative z-10 flex items-center justify-between gap-3 bg-gradient-to-b from-[#020813]/90 to-transparent px-4 py-3.5 sm:px-6"
+      class="relative z-10 flex items-center justify-center gap-4 bg-gradient-to-b from-[#020813]/90 to-transparent px-4 py-3.5 sm:px-6"
     >
-      <div>
-        <div class="flex items-center gap-2">
-          <span
-            class="h-2 w-2 rounded-full transition-all"
-            :class="
-              wsConnected
-                ? 'bg-cyan-400 shadow-[0_0_10px_#22d3ee]'
-                : 'bg-red-500 shadow-[0_0_8px_#ef4444]'
-            "
-          ></span>
-          <h1 class="text-sm font-bold tracking-[0.16em] text-slate-50 sm:text-base">
-            MARIANA TRENCH
-          </h1>
-        </div>
-        <p class="mt-0.5 font-mono text-[11px] tracking-[0.14em] text-sky-300">
-          AI WATER FOOTPRINT · DEPTH {{ currentDepthMeters.toLocaleString() }}m
-        </p>
-      </div>
+      <div class="flex items-center gap-4">
+        <span
+          class="h-2 w-2 rounded-full transition-all"
+          :class="
+            wsConnected
+              ? 'bg-cyan-400 shadow-[0_0_10px_#22d3ee]'
+              : 'bg-red-500 shadow-[0_0_8px_#ef4444]'
+          "
+        ></span>
 
-      <div class="flex items-center gap-3">
-        <!-- Borderless Total Usage Readout -->
-        <div class="flex items-center gap-3.5 px-1 py-1">
-          <div class="flex flex-col items-end">
-            <span class="text-[9px] tracking-[0.12em] text-slate-400">WATER USED</span>
-            <span class="font-mono text-sm font-bold text-cyan-400">
-              {{ totalWaterMl.toFixed(3) }} <span class="text-xs font-medium">mL</span>
-            </span>
-          </div>
-          <div class="h-5 w-px bg-slate-400/25"></div>
-          <div class="flex flex-col items-end">
-            <span class="text-[9px] tracking-[0.12em] text-slate-400">TOKENS</span>
-            <span class="font-mono text-sm font-bold text-slate-100">
-              {{ totalTokens.toLocaleString() }}
-            </span>
-          </div>
+        <div class="flex flex-col items-center">
+          <span class="text-[9px] tracking-[0.14em] text-slate-400">WATER USED</span>
+          <span class="font-mono text-base font-bold text-cyan-400">
+            {{ totalWaterMl.toFixed(3) }} <span class="text-xs font-medium">mL</span>
+          </span>
         </div>
 
-        <button
-          v-if="needsGyroPermission"
-          type="button"
-          class="cursor-pointer rounded-lg border border-cyan-400/45 bg-cyan-700/35 px-2.5 py-1.5 text-xs font-medium text-cyan-100 hover:bg-cyan-700/55"
-          @click="requestGyroPermission"
-        >
-          Enable Tilt
-        </button>
+        <div class="h-6 w-px bg-slate-400/25"></div>
+
+        <div class="flex flex-col items-center">
+          <span class="text-[9px] tracking-[0.14em] text-slate-400">TOKENS</span>
+          <span class="font-mono text-base font-bold text-slate-100">
+            {{ totalTokens.toLocaleString() }}
+          </span>
+        </div>
       </div>
+
+      <button
+        v-if="needsGyroPermission"
+        type="button"
+        class="cursor-pointer rounded-lg border border-cyan-400/45 bg-cyan-700/35 px-2.5 py-1.5 text-xs font-medium text-cyan-100 hover:bg-cyan-700/55"
+        @click="requestGyroPermission"
+      >
+        Enable Tilt
+      </button>
     </header>
 
-    <!-- Bottom-Up Prompt & Water Cost Stream (Sharp Rectangular Cards, Right Padding Clears mL Ruler) -->
+    <!-- Bottom-Up Prompt & Water Cost Stream (Sharp Rectangular Cards, Right Padding Clears 10 mL Ruler) -->
     <main
       ref="feedRef"
-      class="relative z-5 flex flex-1 flex-col-reverse overflow-y-auto pt-3 pr-20 pb-2 pl-4 [mask-image:linear-gradient(to_bottom,transparent_0%,black_14%,black_100%)] [-webkit-mask-image:linear-gradient(to_bottom,transparent_0%,black_14%,black_100%)]"
+      class="relative z-5 flex flex-1 flex-col-reverse overflow-y-auto pt-3 pr-22 pb-2 pl-4 [mask-image:linear-gradient(to_bottom,transparent_0%,black_14%,black_100%)] [-webkit-mask-image:linear-gradient(to_bottom,transparent_0%,black_14%,black_100%)]"
       @scroll="handleFeedScroll"
     >
       <div class="mx-auto flex w-full max-w-2xl flex-col-reverse gap-2.5">
