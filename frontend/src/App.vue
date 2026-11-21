@@ -554,11 +554,11 @@ function isCompleted(status: string): boolean {
         <article
           v-for="item in bottomUpMessages"
           :key="item.id"
-          class="flex items-stretch overflow-hidden rounded-xl border backdrop-blur-md transition-colors duration-300"
+          class="flex max-h-28 shrink-0 items-stretch overflow-hidden rounded-xl border backdrop-blur-md transition-colors duration-300"
           :class="cardClasses(item.status)"
         >
-          <!-- 4/5 Width: Prompt Text -->
-          <div class="flex w-4/5 items-center px-4 py-3">
+          <!-- 4/5 Width: Scrollable Prompt Text within Max Height -->
+          <div class="w-4/5 overflow-y-auto px-4 py-3">
             <p class="break-words text-sm leading-snug">
               {{ item.prompt }}
             </p>
