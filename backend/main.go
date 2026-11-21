@@ -31,12 +31,13 @@ var initSQL string
 const waterCostFactorML = 0.001
 
 type Config struct {
-	Port        string
-	DBPath      string
-	OllamaURL   string
-	OllamaModel string
-	NumPredict  int
-	TDURL       string
+	Port                    string
+	DBPath                  string
+	OllamaURL               string
+	OllamaModel             string
+	NumPredict              int
+	TDURL                   string
+	VisualizationEventToken string
 }
 
 func loadConfig() Config {
@@ -46,12 +47,13 @@ func loadConfig() Config {
 	tdPort := getEnv("HACK_TD_PORT", "8000")
 
 	return Config{
-		Port:        getEnv("PORT", "8080"),
-		DBPath:      getEnv("DB_PATH", "/data/hackathon.db"),
-		OllamaURL:   fmt.Sprintf("http://%s:%s/api/generate", llmHost, llmPort),
-		OllamaModel: getEnv("OLLAMA_MODEL", "qwen3:8b"),
-		NumPredict:  getEnvInt("OLLAMA_NUM_PREDICT", 150),
-		TDURL:       fmt.Sprintf("http://%s:%s/api/visualization/events", tdHost, tdPort),
+		Port:                    getEnv("PORT", "8080"),
+		DBPath:                  getEnv("DB_PATH", "/data/hackathon.db"),
+		OllamaURL:               fmt.Sprintf("http://%s:%s/api/generate", llmHost, llmPort),
+		OllamaModel:             getEnv("OLLAMA_MODEL", "qwen3:8b"),
+		NumPredict:              getEnvInt("OLLAMA_NUM_PREDICT", 150),
+		TDURL:                   fmt.Sprintf("http://%s:%s/api/visualization/events", tdHost, tdPort),
+		VisualizationEventToken: getEnv("VISUALIZATION_EVENT_TOKEN", ""),
 	}
 }
 
@@ -556,6 +558,9 @@ func (a *App) flushOutboxToTD(ctx context.Context, client *http.Client) {
 		}
 		req.Header.Set("Content-Type", "application/json")
 
+		if a.cfg.VisualizationEventToken != "" {
+			req.Header.Set("X-Event-Token", a.cfg.VisualizationEventToken)
+		}
 		res, err := client.Do(req)
 		now := time.Now().UTC().Format(time.RFC3339)
 		if err != nil || res.StatusCode >= 300 {
